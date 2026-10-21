@@ -1,0 +1,3 @@
+Model,RMSE,Stores
+Global LightGBM,935.0919,200
+Local LightGBM (per store),834.5872,200

@@ -1,0 +1,4 @@
+Information_set,mu_sd_across_stores,mu_mean,departure_rms,delta_rms,u_rms,cross_term,share_delta
+Weekly (Store-DOW),2385.14,6938.097,1934.433,980.524,1664.768,9151.542,0.259
+"Calendar, store, promotion (LightGBM)",2385.14,6938.097,1934.433,1626.22,1012.7,71877.234,0.726
+"Plus recent sales (LightGBM, lags)",2385.14,6938.097,1934.433,1764.688,825.543,-53615.121,0.818

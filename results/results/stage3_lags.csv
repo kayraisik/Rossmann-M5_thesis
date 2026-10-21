@@ -1,0 +1,5 @@
+Model,RMSE,Delta_rel,Delta_DOW
+Store-mean naive,1929.8,0,-16.3
+Store-DOW naive,1658.8,14,0
+XGBoost,892.9,53.7,46.2
+LightGBM,825.5,57.2,50.2

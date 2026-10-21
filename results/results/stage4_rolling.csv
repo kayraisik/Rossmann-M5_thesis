@@ -1,0 +1,4 @@
+Window,Test_period,Store_mean,Store_DOW,XGBoost,LightGBM
+Window 1,20 Jun - 31 Jul 2015,1934,1665,1012,1013
+Window 2,09 May - 19 Jun 2015,1815,1496,1100,1063
+Window 3,28 Mar - 08 May 2015,2287,2044,1451,1367

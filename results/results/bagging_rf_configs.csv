@@ -1,0 +1,4 @@
+Model,mtry,RMSE,MAE,MAPE,delta_mean,delta_dow
+"Random Forest (mtry = sqrt p, default)",4,1413,1004,16.2,26.9,15.1
+"Random Forest (mtry = p/3, regression)",5,1212,839,13.3,37.3,27.2
+Bagging (mtry = p),16,1087,743,11.4,43.8,34.7

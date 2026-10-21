@@ -1,0 +1,2 @@
+gain_orig,actual_mean,xgb_pred_mean,xgb_bias,storemean_bias,share_stores_over,bias_promo0,bias_promo1,train_bias_max,xgboost_version,model_loaded,test_week_min,test_week_max,last_train_week,last_week_days,last_week_promo_share,last_week_sales,prev_week_sales,prev_week_promo_share,n_split_last_week,shap_week,shap_total,cf_week_prev_pred_mean,cf_week_prev_gain,cf_week_min_gain,cf_week_max_gain
+-14.355,6978.638,8354.034,1375.396,165.889,0.984,1949.864,564.275,1.168,3.2.1.1,FALSE,25,31,25,5,1,8343.794,6056.074,0,349,840.134,1025.969,7318.708,35.971,34.814,35.971

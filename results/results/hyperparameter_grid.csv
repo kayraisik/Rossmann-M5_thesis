@@ -1,0 +1,7 @@
+Model,Setting,RMSE
+XGBoost,max_depth = 8,948
+XGBoost,max_depth = 10,962
+XGBoost,max_depth = 6,970
+LightGBM,num_leaves = 127,988
+LightGBM,num_leaves = 63,1013
+LightGBM,num_leaves = 31,1068
