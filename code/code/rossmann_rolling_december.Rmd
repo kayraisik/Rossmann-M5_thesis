@@ -1,0 +1,150 @@
+---
+title: "Rolling Test Windows incl. December (Christmas peak)"
+author: "Kayra Isik"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_rolling_december.Rmd
+  PURPOSE   Robustness check adding a December test window. The Stage 4 rolling
+            windows all fall in spring and summer, so the Christmas peak is never
+            in a test period.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   none; results are read from the rendered HTML
+  THESIS    The December window reported alongside Table 16.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      cache = FALSE, fig.align = "center")
+```
+
+# Purpose
+
+The Stage 4 rolling windows all fall in spring--summer 2015, so the December
+sales peak, the strongest seasonal pattern in the data, is never in a holdout.
+This file adds a fourth window that covers December 2014. Its training set is all
+data up to late November 2014, so the model has seen one previous December
+(2013) and is asked to forecast the next one (2014). It is a direct test of
+whether the boosted models generalise the Christmas peak. The pipeline matches
+the rest of the thesis (no-lag features, XGBoost/LightGBM with temporal-validation
+early stopping, against the two store-level baselines).
+
+# 1. Packages, data, pipeline
+
+```{r packages}
+library(tidyverse); library(lubridate); library(xgboost); library(lightgbm)
+TRAIN_CSV <- "train.csv"; STORE_CSV <- "store.csv"
+VAL_FRAC <- 0.15; SEED <- 42
+N_THREADS <- max(1L, parallel::detectCores() - 1L); set.seed(SEED)
+```
+
+```{r load}
+train_raw <- read_csv(TRAIN_CSV, show_col_types = FALSE) %>% mutate(Date = as.Date(Date))
+store_raw <- read_csv(STORE_CSV, show_col_types = FALSE)
+df <- train_raw %>% filter(Open == 1, Sales > 0) %>% left_join(store_raw, by = "Store") %>%
+  mutate(Year=year(Date), Month=month(Date), Week=isoweek(Date), DayOfMonth=mday(Date),
+         Quarter=quarter(Date), IsWeekend=as.integer(DayOfWeek %in% c(6,7)),
+         StateHoliday=case_when(StateHoliday=="a"~1L,StateHoliday=="b"~2L,StateHoliday=="c"~3L,TRUE~0L),
+         CompetitionOpenMonths=ifelse(!is.na(CompetitionOpenSinceYear)&!is.na(CompetitionOpenSinceMonth),
+           (Year-CompetitionOpenSinceYear)*12+(Month-CompetitionOpenSinceMonth),NA_real_),
+         CompetitionOpenMonths=pmax(CompetitionOpenMonths,0,na.rm=TRUE),
+         StoreType=as.integer(factor(StoreType,levels=c("a","b","c","d"))),
+         Assortment=as.integer(factor(Assortment,levels=c("a","b","c")))) %>%
+  mutate(CompetitionDistance=replace_na(CompetitionDistance, median(CompetitionDistance,na.rm=TRUE)),
+         CompetitionOpenMonths=replace_na(CompetitionOpenMonths,0)) %>%
+  arrange(Date, Store)
+FEAT <- c("Store","DayOfWeek","Promo","StateHoliday","SchoolHoliday","StoreType","Assortment",
+          "CompetitionDistance","Promo2","Year","Month","Week","DayOfMonth","Quarter",
+          "IsWeekend","CompetitionOpenMonths")
+cat("data range:", as.character(min(df$Date)), "to", as.character(max(df$Date)), "\n")
+```
+
+```{r pipeline}
+eval_rmse <- function(a,p) sqrt(mean((a-p)^2))
+delta_rel <- function(ref,x) (ref-x)/ref*100
+
+# split by an explicit test window [start,end]; train = everything before start
+split_window <- function(data, feats, start, end) {
+  start <- as.Date(start); end <- as.Date(end)
+  tr <- data %>% filter(Date < start)
+  te <- data %>% filter(Date >= start, Date <= end)
+  list(Xtr=as.matrix(tr[,feats]), ytr=tr$Sales, Xte=as.matrix(te[,feats]),
+       yte=te$Sales, tr=tr, te=te)
+}
+val_idx <- function(tr){ d<-sort(unique(tr$Date)); cut<-d[floor(length(d)*(1-VAL_FRAC))]; which(tr$Date>cut) }
+
+pred_mean <- function(sp){ m<-sp$tr %>% group_by(Store) %>% summarise(mu=mean(Sales),.groups="drop")
+  gm<-mean(sp$tr$Sales); sp$te %>% left_join(m,by="Store") %>% mutate(p=coalesce(mu,gm)) %>% pull(p) }
+pred_dow <- function(sp){ dm<-sp$tr %>% group_by(Store,DayOfWeek) %>% summarise(md=mean(Sales),.groups="drop")
+  m<-sp$tr %>% group_by(Store) %>% summarise(mu=mean(Sales),.groups="drop"); gm<-mean(sp$tr$Sales)
+  sp$te %>% left_join(dm,by=c("Store","DayOfWeek")) %>% left_join(m,by="Store") %>%
+    mutate(p=coalesce(md,mu,gm)) %>% pull(p) }
+
+run_xgb <- function(sp){ vi<-val_idx(sp$tr); ti<-setdiff(seq_along(sp$ytr),vi)
+  pr<-list(objective="reg:squarederror",eta=0.10,max_depth=6,subsample=0.8,
+           colsample_bytree=0.8,nthread=N_THREADS,verbosity=0)
+  es<-xgb.train(pr,xgb.DMatrix(sp$Xtr[ti,],label=sp$ytr[ti]),nrounds=1500,
+       watchlist=list(v=xgb.DMatrix(sp$Xtr[vi,],label=sp$ytr[vi])),early_stopping_rounds=50,verbose=0)
+  fit<-xgb.train(pr,xgb.DMatrix(sp$Xtr,label=sp$ytr),nrounds=es$best_iteration,verbose=0)
+  predict(fit,xgb.DMatrix(sp$Xte)) }
+run_lgb <- function(sp){ vi<-val_idx(sp$tr); ti<-setdiff(seq_along(sp$ytr),vi)
+  pr<-list(objective="regression",metric="rmse",num_leaves=63,learning_rate=0.05,
+           bagging_fraction=0.8,bagging_freq=1,feature_fraction=0.8,num_threads=N_THREADS,seed=SEED,verbosity=-1)
+  es<-lgb.train(pr,lgb.Dataset(sp$Xtr[ti,],label=sp$ytr[ti]),nrounds=2000,
+       valids=list(v=lgb.Dataset(sp$Xtr[vi,],label=sp$ytr[vi])),early_stopping_rounds=50,verbose=-1)
+  fit<-lgb.train(pr,lgb.Dataset(sp$Xtr,label=sp$ytr),nrounds=es$best_iter,verbose=-1)
+  predict(fit,sp$Xte) }
+
+score_window <- function(start, end, name) {
+  sp <- split_window(df, FEAT, start, end)
+  rm <- eval_rmse(sp$yte, pred_mean(sp)); rd <- eval_rmse(sp$yte, pred_dow(sp))
+  rx <- eval_rmse(sp$yte, run_xgb(sp));   rl <- eval_rmse(sp$yte, run_lgb(sp))
+  tibble(Window=name, test_obs=length(sp$yte), train_days=n_distinct(sp$tr$Date),
+         Store_mean=round(rm), Store_DOW=round(rd), XGBoost=round(rx), LightGBM=round(rl),
+         XGB_dDOW=round(delta_rel(rd,rx),1), LGB_dDOW=round(delta_rel(rd,rl),1))
+}
+```
+
+# 2. Four windows, including December 2014
+
+```{r windows, cache=TRUE}
+windows <- tribble(
+  ~name,                       ~start,        ~end,
+  "W1 (20 Jun-31 Jul 2015)",   "2015-06-20",  "2015-07-31",
+  "W2 (9 May-19 Jun 2015)",    "2015-05-09",  "2015-06-19",
+  "W3 (28 Mar-8 May 2015)",    "2015-03-28",  "2015-05-08",
+  "W4 (30 Nov 2014-10 Jan 2015, Christmas)", "2014-11-30", "2015-01-10"
+)
+rolling <- pmap_dfr(windows, function(name,start,end) score_window(start,end,name))
+rolling
+# Written for the thesis: Table 16, window 4 (the December peak). Windows 1 to
+# 3 come from rossmann_stages2_4.Rmd.
+dir.create("thesis_tables", showWarnings = FALSE)
+readr::write_csv(rolling, "thesis_tables/rolling_december.csv")
+```
+
+# 3. Read-off
+
+```{r verdict}
+cat("W1-W3 should reproduce the thesis rolling table (XGBoost stochastic ~1-2%).\n")
+cat("W4 is the new test: does the December peak break the advantage?\n")
+cat(" - If XGB/LGBM still beat Store-DOW by a similar margin, the models generalise\n")
+cat("   the Christmas peak (they have the Month feature and saw December 2013).\n")
+cat(" - If the margin collapses, the spring-summer robustness did not extend to December.\n")
+```
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,136 @@
+---
+title: "Rossmann Stage 5 — Incremental Information Sets (fixed origin)"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_stage5.Rmd
+  PURPOSE   Stage 5. XGBoost and LightGBM on four nested information sets,
+            fixed-origin 42-day forecast. The shortest lag is 42 days, so no
+            test-period sales enter the features.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   none; results are read from the rendered HTML
+  THESIS    Table 17. The Stage 5 information-path figure is drawn by the .Rnw from
+            these numbers.
+  NOTE      Named in the thesis reproducibility statement.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+Self-contained. XGBoost and LightGBM on four nested feature sets, fixed-origin
+42-day forecast (shortest lag = 42 days, so no test-period sales leak in). Needs
+only `train.csv` and `store.csv`.
+
+# Pipeline
+
+```{r pipeline}
+library(tidyverse); library(lubridate); library(zoo); library(xgboost); library(lightgbm)
+TRAIN_CSV<-"train.csv"; STORE_CSV<-"store.csv"
+N_THREADS<-max(1,parallel::detectCores()-1); TEST_DAYS<-42; VAL_FRAC<-0.15; SEED<-42; set.seed(SEED)
+
+train_raw <- read_csv(TRAIN_CSV, show_col_types=FALSE) %>% mutate(Date=as.Date(Date))
+store_raw <- read_csv(STORE_CSV, show_col_types=FALSE)
+df0 <- train_raw %>% filter(Open==1, Sales>0) %>% left_join(store_raw,by="Store") %>%
+  mutate(Year=year(Date), Month=month(Date), Week=isoweek(Date), DayOfMonth=mday(Date),
+         Quarter=quarter(Date), IsWeekend=as.integer(DayOfWeek %in% c(6,7)),
+         ForecastTrend=as.integer(Date-min(Date)),
+         StateHoliday=case_when(StateHoliday=="a"~1L,StateHoliday=="b"~2L,StateHoliday=="c"~3L,TRUE~0L),
+         CompetitionOpenMonths=ifelse(!is.na(CompetitionOpenSinceYear)&!is.na(CompetitionOpenSinceMonth),
+           (Year-CompetitionOpenSinceYear)*12+(Month-CompetitionOpenSinceMonth),NA_real_),
+         CompetitionOpenMonths=pmax(CompetitionOpenMonths,0,na.rm=TRUE),
+         StoreType=as.integer(factor(StoreType,levels=c("a","b","c","d"))),
+         Assortment=as.integer(factor(Assortment,levels=c("a","b","c")))) %>%
+  select(Store,Date,Sales,DayOfWeek,Promo,StateHoliday,SchoolHoliday,StoreType,Assortment,
+         CompetitionDistance,Promo2,Year,Month,Week,DayOfMonth,Quarter,IsWeekend,ForecastTrend,CompetitionOpenMonths)
+med<-median(df0$CompetitionDistance,na.rm=TRUE)
+df0 <- df0 %>% mutate(CompetitionDistance=replace_na(CompetitionDistance,med),
+                      CompetitionOpenMonths=replace_na(CompetitionOpenMonths,0),
+                      Promo2=replace_na(Promo2,0L)) %>% arrange(Date,Store)
+
+# origin-safe history (available 42 days before the test)
+add_origin_safe <- function(s){ s<-s %>% arrange(Date)
+  s$lag42<-lag(s$Sales,42); s$lag49<-lag(s$Sales,49); s$lag56<-lag(s$Sales,56); s$lag84<-lag(s$Sales,84)
+  s$origin_roll7<-lag(rollmeanr(s$Sales,7,fill=NA),42); s$origin_roll28<-lag(rollmeanr(s$Sales,28,fill=NA),42); s }
+df <- df0 %>% group_by(Store) %>% group_modify(~ add_origin_safe(.x)) %>% ungroup() %>%
+  filter(!is.na(lag84), !is.na(origin_roll28)) %>% arrange(Date,Store)
+
+HISTORY<-c("Store","lag42","lag49","lag56","lag84","origin_roll7","origin_roll28")
+CALENDAR<-c("DayOfWeek","Month","Week","DayOfMonth","Quarter","IsWeekend","Year","ForecastTrend")
+STOREATTR<-c("StoreType","Assortment","CompetitionDistance","CompetitionOpenMonths")
+COMMERCIAL<-c("Promo","Promo2","StateHoliday","SchoolHoliday")
+FEATURE_STAGES<-list("1 History only"=HISTORY, "2 + Calendar"=c(HISTORY,CALENDAR),
+  "3 + Store attributes"=c(HISTORY,CALENDAR,STOREATTR),
+  "4 + Promotions and holidays"=c(HISTORY,CALENDAR,STOREATTR,COMMERCIAL))
+FEAT_S1<-c("Store","DayOfWeek","Promo","StateHoliday","SchoolHoliday","StoreType","Assortment",
+  "CompetitionDistance","Promo2","Year","Month","Week","DayOfMonth","Quarter","IsWeekend","CompetitionOpenMonths")
+
+split_data<-function(data,fc,td=TEST_DAYS){ data<-data %>% arrange(Date,Store)
+  d<-sort(unique(data$Date)); cut<-d[length(d)-td]; tr<-data %>% filter(Date<=cut); te<-data %>% filter(Date>cut)
+  list(X_train=as.matrix(tr[,fc]),y_train=tr$Sales,X_test=as.matrix(te[,fc]),y_test=te$Sales,train=tr,test=te) }
+eval_metrics<-function(a,p){ v<-!is.na(a)&a!=0; tibble(RMSE=sqrt(mean((a-p)^2)),MAE=mean(abs(a-p)),MAPE=mean(abs((a[v]-p[v])/a[v]))*100) }
+delta_rel<-function(ref,x)(ref-x)/ref*100
+run_store_mean<-function(sp){ sm<-sp$train %>% group_by(Store) %>% summarise(m=mean(Sales),.groups="drop")
+  p<-sp$test %>% left_join(sm,by="Store") %>% mutate(m=replace_na(m,mean(sp$train$Sales))) %>% pull(m); eval_metrics(sp$y_test,p) }
+run_store_dow<-function(sp){ dm<-sp$train %>% group_by(Store,DayOfWeek) %>% summarise(md=mean(Sales),.groups="drop")
+  sm<-sp$train %>% group_by(Store) %>% summarise(ms=mean(Sales),.groups="drop"); gm<-mean(sp$train$Sales)
+  p<-sp$test %>% left_join(dm,by=c("Store","DayOfWeek")) %>% left_join(sm,by="Store") %>% mutate(p=coalesce(md,ms,gm)) %>% pull(p); eval_metrics(sp$y_test,p) }
+val_idx<-function(tr,vf=VAL_FRAC){ d<-sort(unique(tr$Date)); which(tr$Date>d[floor(length(d)*(1-vf))]) }
+run_xgboost<-function(sp,max_rounds=1500,es=50){ X<-sp$X_train;y<-sp$y_train; vi<-val_idx(sp$train);ti<-setdiff(seq_along(y),vi)
+  pr<-list(objective="reg:squarederror",eta=0.10,max_depth=6,subsample=0.8,colsample_bytree=0.8,nthread=N_THREADS,verbosity=0)
+  e<-xgb.train(pr,xgb.DMatrix(X[ti,],label=y[ti]),nrounds=max_rounds,watchlist=list(val=xgb.DMatrix(X[vi,],label=y[vi])),early_stopping_rounds=es,verbose=0)
+  f<-xgb.train(pr,xgb.DMatrix(X,label=y),nrounds=e$best_iteration,verbose=0); eval_metrics(sp$y_test,predict(f,xgb.DMatrix(sp$X_test))) }
+run_lightgbm<-function(sp,max_rounds=2000,es=50){ X<-sp$X_train;y<-sp$y_train; vi<-val_idx(sp$train);ti<-setdiff(seq_along(y),vi)
+  pr<-list(objective="regression",metric="rmse",num_leaves=63,learning_rate=0.05,bagging_fraction=0.8,bagging_freq=1,feature_fraction=0.8,num_threads=N_THREADS,seed=SEED,verbosity=-1)
+  e<-lgb.train(pr,lgb.Dataset(X[ti,],label=y[ti]),nrounds=max_rounds,valids=list(val=lgb.Dataset(X[vi,],label=y[vi])),early_stopping_rounds=es,verbose=-1)
+  f<-lgb.train(pr,lgb.Dataset(X,label=y),nrounds=e$best_iter,verbose=-1); eval_metrics(sp$y_test,predict(f,sp$X_test)) }
+
+sp_base<-split_data(df,FEAT_S1); rmse_mean<-run_store_mean(sp_base)$RMSE; rmse_dow<-run_store_dow(sp_base)$RMSE
+cat(sprintf("Store-mean %.0f | Store-DOW %.0f | rows %d\n", rmse_mean, rmse_dow, nrow(df)))
+```
+
+# Nested information sets
+
+```{r run, cache=TRUE}
+stage5 <- imap_dfr(FEATURE_STAGES, function(feats,lab){ sp<-split_data(df,feats)
+  xg<-run_xgboost(sp); lg<-run_lightgbm(sp)
+  bind_rows(tibble(Model="XGBoost",RMSE=xg$RMSE,MAPE=xg$MAPE),
+            tibble(Model="LightGBM",RMSE=lg$RMSE,MAPE=lg$MAPE)) %>% mutate(`Information set`=lab,.before=1) }) %>%
+  mutate(Delta_DOW=delta_rel(rmse_dow,RMSE), RMSE=round(RMSE), across(c(MAPE,Delta_DOW), ~round(.x,1)))
+stage5
+# Written for the thesis: Table 17 (Stage 5, nested information sets). The
+# Stage 5 information-path figure is drawn by the .Rnw from the same numbers.
+dir.create("thesis_tables", showWarnings = FALSE)
+readr::write_csv(stage5, "thesis_tables/stage5_information_sets.csv")
+```
+
+```{r plot, fig.width=7.5, fig.height=4.5}
+stage5 %>% mutate(step=as.integer(str_extract(`Information set`,"^\\d"))) %>%
+  ggplot(aes(step,RMSE,colour=Model)) +
+  geom_hline(yintercept=rmse_dow, linetype="dashed", colour="grey50") +
+  geom_line(linewidth=1)+geom_point(size=2.5)+
+  scale_x_continuous(breaks=1:4, labels=c("1 History","2 +Calendar","3 +Store","4 +Promo/Hol"))+
+  scale_colour_manual(values=c(XGBoost="#C44E52", LightGBM="#4C72B0"))+
+  labs(title="Stage 5 — RMSE across nested information sets", x=NULL, y="Test RMSE (fixed origin)")+
+  theme_minimal(base_size=12)
+```
+
+`Delta_DOW` = % improvement over Store-DOW (`r round(rmse_dow)`). For the
+Auto-ARIMA comparison, use the ARIMA RMSE from the Stage 1 output.
+
+```{r session}
+sessionInfo()
+```

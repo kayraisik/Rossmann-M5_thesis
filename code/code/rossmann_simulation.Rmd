@@ -1,0 +1,186 @@
+---
+title: "Simulation Study: A Controlled Test of the Decomposition Framework"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_simulation.Rmd
+  PURPOSE   Standalone simulation study of the decomposition framework.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   none
+  THESIS    NOT USED. It supported a section that was cut from the thesis. The
+            simulation that is in the thesis lives in the sim-ladder chunk of the
+            .Rnw, not here.
+  NOTE      Kept because earlier drafts refer to it.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+set.seed(42)
+```
+
+# Purpose
+
+The framework predicts that the gain of a tree-based estimator over a
+store-mean forecast is approximately
+\[
+  \mathrm{MSE}^{\text{naive}} - \mathrm{MSE}^{\text{tree}}
+  \;\approx\; \mathrm{Var}(\delta)\,\rho^2,
+\]
+where \(\mathrm{Var}(\delta)\) is the amount of predictable within-store
+variation and \(\rho^2\) is how well the available features let the tree recover
+it. This file tests that prediction on **simulated data with a known
+data-generating process (DGP)**, so the two quantities can be controlled
+directly. It is the "running example'' of the thesis: a transparent setting in
+which the theoretical mechanism can be switched on and off.
+
+## The data-generating process
+
+For store \(s=1,\dots,N\) and day \(t=1,\dots,T\), sales are generated as
+\[
+  y_{s,t} = \mu_s + \delta_{s,t} + \phi_{s,t} + \varepsilon_{s,t},
+\]
+matching the decomposition used in the theoretical framework:
+
+- \(\mu_s\) is a store fixed effect (long-run level), drawn once per store;
+- \(\delta_{s,t}\) is the **predictable** component, a function of *observable*
+  features (day-of-week and promotion), whose variance is set by `sd_delta`;
+- \(\phi_{s,t}\) is a **systematic but unobservable** component, driven by a
+  latent factor the estimator never sees, with variance set by `sd_phi`;
+- \(\varepsilon_{s,t}\) is mean-zero noise with standard deviation `sd_eps`.
+
+Only day-of-week and promotion enter the estimator's feature matrix, so the
+store-mean baseline leaves all of \(\delta\) unexplained, while the tree can
+recover the part of \(\delta\) that the features identify. Two knobs are varied:
+the strength of the predictable signal (`sd_delta`) and the share of \(\delta\)
+the features can actually recover (`signal_share`, a proxy for \(\rho^2\)).
+
+# 1. Packages and helpers
+
+```{r packages}
+library(tidyverse)
+library(lightgbm)
+
+N_THREADS <- max(1, parallel::detectCores() - 1)
+
+# Generate one panel data set under the DGP.
+simulate_panel <- function(N = 150, T = 364, sd_mu = 2000,
+                           sd_delta = 600, signal_share = 0.8,
+                           sd_phi = 300, sd_eps = 300, seed = 1) {
+  set.seed(seed)
+  dow_effect   <- rnorm(7, 0, 1)                 # weekly shape (shared)
+  promo_effect <- 1.2                            # promotion lift (shared)
+  grid <- expand_grid(store = 1:N, t = 1:T) %>%
+    mutate(
+      dow    = ((t - 1) %% 7) + 1,
+      promo  = rbinom(n(), 1, 0.35),
+      mu     = rnorm(N, 6000, sd_mu)[store],
+      # predictable component from OBSERVABLE features (dow + promo):
+      delta_obs = dow_effect[dow] + promo_effect * promo,
+      # a predictable-looking part driven by a HIDDEN factor (becomes phi):
+      hidden    = rnorm(n()),
+      delta_hid = hidden
+    )
+  # scale the observable and hidden predictable parts so that
+  #   Var(delta_obs) / (Var(delta_obs)+Var(delta_hid)) = signal_share,
+  #   and total predictable sd = sd_delta.
+  vo <- var(grid$delta_obs); vh <- var(grid$delta_hid)
+  a  <- sqrt(signal_share)        / sqrt(vo)
+  b  <- sqrt(1 - signal_share)    / sqrt(vh)
+  grid <- grid %>%
+    mutate(
+      delta = sd_delta * (a * delta_obs),         # recoverable from features
+      phi   = sd_delta * (b * delta_hid) + rnorm(n(), 0, sd_phi),
+      eps   = rnorm(n(), 0, sd_eps),
+      sales = mu + delta + phi + eps
+    )
+  grid
+}
+```
+
+> Note: in the DGP the *recoverable* predictable variance is `Var(delta)` and
+> the unrecoverable systematic part is folded into `phi`. The framework's
+> predicted gap is therefore `Var(delta)` (the part the features identify),
+> which we read directly from the simulated series below.
+
+# 2. Single illustrative panel
+
+```{r single}
+df <- simulate_panel(N = 150, T = 364, sd_delta = 600, signal_share = 0.8)
+cut <- floor(max(df$t) * 0.85)
+tr  <- df %>% filter(t <= cut); te <- df %>% filter(t > cut)
+feats <- c("store","dow","promo")
+sm <- tr %>% group_by(store) %>% summarise(m = mean(sales), .groups="drop")
+mse_naive <- mean((te$sales - (te %>% left_join(sm, by="store") %>% pull(m)))^2)
+mm <- lgb.train(list(objective="regression", metric="rmse", num_leaves=31,
+                     learning_rate=0.1, num_threads=N_THREADS, verbosity=-1),
+                lgb.Dataset(as.matrix(tr[,feats]), label=tr$sales),
+                nrounds=200, verbose=-1)
+mse_tree <- mean((te$sales - predict(mm, as.matrix(te[,feats])))^2)
+cat(sprintf("Empirical gap (MSE_naive - MSE_tree): %.0f\n", mse_naive - mse_tree))
+cat(sprintf("Var(delta) (recoverable signal):      %.0f\n", var(df$delta)))
+```
+
+# 3. Grid: gap versus Var(delta) and the recoverable share
+
+```{r grid, cache=TRUE}
+run_cell <- function(sd_delta, signal_share, rep) {
+  d <- simulate_panel(N = 120, T = 364, sd_delta = sd_delta,
+                      signal_share = signal_share, seed = 1000*rep + sd_delta)
+  cut <- floor(max(d$t) * 0.85); tr <- d %>% filter(t<=cut); te <- d %>% filter(t>cut)
+  sm <- tr %>% group_by(store) %>% summarise(m=mean(sales), .groups="drop")
+  mn <- mean((te$sales - (te %>% left_join(sm,by="store") %>% pull(m)))^2)
+  mo <- lgb.train(list(objective="regression",metric="rmse",num_leaves=31,
+                       learning_rate=0.1,num_threads=N_THREADS,verbosity=-1),
+                  lgb.Dataset(as.matrix(tr[,c("store","dow","promo")]),label=tr$sales),
+                  nrounds=200, verbose=-1)
+  mt <- mean((te$sales - predict(mo, as.matrix(te[,c("store","dow","promo")])))^2)
+  tibble(sd_delta = sd_delta, signal_share = signal_share,
+         var_delta = var(d$delta), gap = mn - mt)
+}
+
+grid <- expand_grid(sd_delta = c(200, 400, 600, 800),
+                    signal_share = c(0.3, 0.6, 0.9), rep = 1:20) %>%
+  pmap_dfr(function(sd_delta, signal_share, rep) run_cell(sd_delta, signal_share, rep)) %>%
+  group_by(sd_delta, signal_share) %>%
+  summarise(var_delta = mean(var_delta), gap = mean(gap), .groups = "drop")
+grid
+```
+
+```{r grid-plots, fig.width=9, fig.height=4}
+p1 <- ggplot(grid, aes(var_delta, gap, colour = factor(signal_share))) +
+  geom_point(size = 2) + geom_line() +
+  labs(x = "Var(delta) (predictable signal)", y = "Empirical gap in MSE",
+       colour = "Recoverable\nshare", title = "Gap grows with predictable variation") +
+  theme_minimal(base_size = 12)
+p2 <- ggplot(grid, aes(signal_share, gap, colour = factor(sd_delta))) +
+  geom_point(size = 2) + geom_line() +
+  labs(x = "Recoverable share of delta (proxy for rho^2)", y = "Empirical gap in MSE",
+       colour = "sd(delta)", title = "Gap grows with how much the features recover") +
+  theme_minimal(base_size = 12)
+print(p1); print(p2)
+```
+
+# 4. Interpretation
+
+The empirical gap rises with both the strength of the predictable signal
+(`Var(delta)`) and the share of it the features can recover (`signal_share`),
+exactly the two terms in `Var(delta) * rho^2`. When either is near zero the tree
+has nothing to add over the store mean. This reproduces, in a controlled
+setting, the mechanism the empirical chapters test on Rossmann.
+
+```{r session}
+sessionInfo()
+```

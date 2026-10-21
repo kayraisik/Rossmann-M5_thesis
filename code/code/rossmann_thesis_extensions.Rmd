@@ -1,0 +1,574 @@
+---
+title: "Rossmann Thesis Extensions — Fixed-Origin Forecasts, Inference, and Framework Validation"
+author: "Kayra Isik"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_thesis_extensions.Rmd
+  PURPOSE   EARLIER VERSION OF STAGE 6. Runs the same E1 to E7 analyses, plus the E8
+            descriptive tables and the framework-validation figure.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   rossmann_outputs/tab_e1 ... tab_e8_*.csv, fig_framework_test.pdf
+  THESIS    Tables 5 and 6 (from tab_e8_*), and fig_framework_test.pdf.
+            Its tab_e1 to tab_e7 outputs are superseded: the thesis reports the
+            values in rossmann_stage6.html.
+  NOTE      Kept because it is the only source of the E8 tables and the framework
+            figure. For E1 to E7, read rossmann_stage6.Rmd instead.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      cache = TRUE, cache.lazy = FALSE)
+set.seed(42)
+```
+
+# 0  Purpose and contents
+
+This file complements `rossmann_final_comprehensive.Rmd`. It adds the analyses
+recommended for the final thesis version. Each experiment has its own section
+and a `RUN_*` switch so expensive parts can be skipped:
+
+| ID | Experiment | Thesis use |
+|----|------------|-----------|
+| E1 | Fixed-origin **recursive** 42-day forecast with lag features | Separates "information value of lags" from "value of daily updating" (Stage 3b) |
+| E2 | **Diebold–Mariano** tests on the primary holdout | Statistical significance of model differences |
+| E3 | Stage 2 replication **standard deviations** (number of stores) | Uncertainty bands for subset experiments |
+| E4 | **Framework validation**: per-store gain vs.\ predictable variation | Direct test of the Var(delta) mechanism |
+| E5 | **Hyperparameter grid** (XGBoost depth x LightGBM leaves) | Is the LightGBM > XGBoost ranking tuning-robust? |
+| E6 | **Type-A-only** scale experiment | Separates composition from scale in Prediction 1 |
+| E7 | **Global vs.\ local** LightGBM | What does cross-learning contribute? |
+| E8 | **Descriptive statistics & EDA exports** | Data section tables/figures, incl. store-type/Sunday table |
+
+```{r run-switches}
+RUN_E1_RECURSIVE   <- TRUE
+RUN_E2_DM_TESTS    <- TRUE
+RUN_E3_SUBSET_SD   <- TRUE   # ~30 boosted fits
+RUN_E4_FRAMEWORK   <- TRUE
+RUN_E5_GRID        <- TRUE   # 9 boosted fits
+RUN_E6_TYPEA_SCALE <- TRUE   # ~30 boosted fits
+RUN_E7_GLOBAL_LOCAL<- TRUE   # 1 global + N_LOCAL_STORES small fits
+N_LOCAL_STORES     <- 200    # stores sampled for the local-model comparison
+```
+
+# 1  Packages, paths, data
+
+Identical preprocessing to the comprehensive file, condensed.
+
+```{r packages}
+library(tidyverse)
+library(lubridate)
+library(xgboost)
+library(lightgbm)
+library(zoo)
+library(forecast)   # dm.test
+
+DATA_DIR   <- "/home/whu/isik.kayra/projects"
+TRAIN_CSV  <- file.path(DATA_DIR, "train.csv")
+STORE_CSV  <- file.path(DATA_DIR, "store.csv")
+OUTPUT_DIR <- "rossmann_outputs"
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+N_THREADS <- max(1L, parallel::detectCores() - 1L)
+SEEDS     <- c(42, 123, 7, 999, 2024)
+TEST_DAYS <- 42
+```
+
+```{r data-prep}
+train_raw <- read_csv(TRAIN_CSV, col_types = cols(
+  Store = col_integer(), DayOfWeek = col_integer(),
+  Date = col_date(format = "%Y-%m-%d"), Sales = col_double(),
+  Customers = col_double(), Open = col_integer(), Promo = col_integer(),
+  StateHoliday = col_character(), SchoolHoliday = col_integer()))
+
+store_raw <- read_csv(STORE_CSV, col_types = cols(.default = col_guess(),
+  Store = col_integer(), StoreType = col_character()))
+
+# Open-day modelling frame (same feature engineering as the comprehensive file)
+df <- train_raw %>%
+  filter(Open == 1, Sales > 0) %>%
+  left_join(store_raw, by = "Store") %>%
+  mutate(
+    Year = year(Date), Month = month(Date), Week = isoweek(Date),
+    DayOfMonth = mday(Date), Quarter = quarter(Date),
+    IsWeekend = as.integer(DayOfWeek %in% c(6, 7)),
+    StateHoliday = case_when(StateHoliday == "a" ~ 1L, StateHoliday == "b" ~ 2L,
+                             StateHoliday == "c" ~ 3L, TRUE ~ 0L),
+    CompetitionOpenMonths = pmax(
+      ifelse(!is.na(CompetitionOpenSinceYear) & !is.na(CompetitionOpenSinceMonth),
+             (Year - CompetitionOpenSinceYear) * 12 + (Month - CompetitionOpenSinceMonth),
+             NA_real_), 0, na.rm = TRUE),
+    StoreTypeLabel = toupper(StoreType),
+    StoreType  = as.integer(factor(StoreType,  levels = c("a","b","c","d"))),
+    Assortment = as.integer(factor(Assortment, levels = c("a","b","c")))
+  ) %>%
+  mutate(
+    CompetitionDistance   = replace_na(CompetitionDistance,
+                                       median(CompetitionDistance, na.rm = TRUE)),
+    CompetitionOpenMonths = replace_na(CompetitionOpenMonths, 0)
+  ) %>%
+  arrange(Date, Store)
+
+FEAT_S1 <- c("Store","DayOfWeek","Promo","StateHoliday","SchoolHoliday",
+             "StoreType","Assortment","CompetitionDistance","Promo2",
+             "Year","Month","Week","DayOfMonth","Quarter","IsWeekend",
+             "CompetitionOpenMonths")
+LAG_COLS  <- c("lag1","lag7","lag14","lag28")
+ROLL_COLS <- c("roll7_mean","roll28_mean")
+FEAT_S3   <- c(FEAT_S1, LAG_COLS, ROLL_COLS)
+
+# Primary split: final 42 days are the test period
+all_dates  <- sort(unique(df$Date))
+cutoff     <- all_dates[length(all_dates) - TEST_DAYS]
+train_df   <- df %>% filter(Date <= cutoff)
+test_df    <- df %>% filter(Date >  cutoff)
+test_dates <- sort(unique(test_df$Date))
+cat("Train rows:", nrow(train_df), "| Test rows:", nrow(test_df), "\n")
+```
+
+# 2  Shared helpers
+
+Compact fitting helpers. Early stopping uses the last 42 training days as a
+temporal validation slice (cheaper than k-fold; rounded selection is then
+refit on the full training data). Metric helpers mirror the comprehensive file.
+
+```{r helpers}
+rmse <- function(a, p) sqrt(mean((a - p)^2))
+
+# --- Store-DOW baseline: mean training sales per (Store, DayOfWeek) --------
+predict_store_dow <- function(train, test) {
+  lookup_dow   <- train %>% group_by(Store, DayOfWeek) %>%
+    summarise(p = mean(Sales), .groups = "drop")
+  lookup_store <- train %>% group_by(Store) %>%
+    summarise(p_store = mean(Sales), .groups = "drop")
+  test %>%
+    left_join(lookup_dow,   by = c("Store","DayOfWeek")) %>%
+    left_join(lookup_store, by = "Store") %>%
+    mutate(p = coalesce(p, p_store)) %>% pull(p)
+}
+
+# --- Temporal validation split (last 42 train days) for early stopping -----
+make_es_slice <- function(train, feats) {
+  tr_dates <- sort(unique(train$Date))
+  val_cut  <- tr_dates[length(tr_dates) - TEST_DAYS]
+  inner    <- train %>% filter(Date <= val_cut)
+  val      <- train %>% filter(Date >  val_cut)
+  list(X_in = as.matrix(inner[, feats]), y_in = inner$Sales,
+       X_va = as.matrix(val[,   feats]), y_va = val$Sales)
+}
+
+# --- LightGBM: pick rounds on validation slice, refit on full train --------
+fit_lgbm <- function(train, feats, num_leaves = 63, lr = 0.05,
+                     max_rounds = 1000, seed = 42) {
+  s <- make_es_slice(train, feats)
+  params <- list(objective = "regression", metric = "rmse",
+                 num_leaves = num_leaves, learning_rate = lr,
+                 bagging_fraction = 0.8, bagging_freq = 1,
+                 feature_fraction = 0.8, num_threads = N_THREADS,
+                 seed = seed, bagging_seed = seed,
+                 feature_fraction_seed = seed, verbosity = -1)
+  es <- lightgbm::lgb.train(params, lightgbm::lgb.Dataset(s$X_in, label = s$y_in),
+                            nrounds = max_rounds,
+                            valids = list(val = lightgbm::lgb.Dataset(s$X_va, label = s$y_va)),
+                            early_stopping_rounds = 40, verbose = -1)
+  lightgbm::lgb.train(params,
+                      lightgbm::lgb.Dataset(as.matrix(train[, feats]), label = train$Sales),
+                      nrounds = es$best_iter, verbose = -1)
+}
+
+# --- XGBoost: same scheme ---------------------------------------------------
+fit_xgb <- function(train, feats, max_depth = 6, eta = 0.1,
+                    max_rounds = 300, seed = 42) {
+  s <- make_es_slice(train, feats)
+  params <- list(objective = "reg:squarederror", eta = eta,
+                 max_depth = max_depth, subsample = 0.8,
+                 colsample_bytree = 0.8, nthread = N_THREADS, seed = seed)
+  es <- xgboost::xgb.train(params,
+                           xgboost::xgb.DMatrix(s$X_in, label = s$y_in),
+                           nrounds = max_rounds,
+                           watchlist = list(val = xgboost::xgb.DMatrix(s$X_va, label = s$y_va)),
+                           early_stopping_rounds = 20, verbose = 0)
+  xgboost::xgb.train(params,
+                     xgboost::xgb.DMatrix(as.matrix(train[, feats]), label = train$Sales),
+                     nrounds = es$best_iteration, verbose = 0)
+}
+
+predict_model <- function(model, newdata, feats) {
+  X <- as.matrix(newdata[, feats])
+  if (inherits(model, "lgb.Booster")) predict(model, X)
+  else predict(model, xgboost::xgb.DMatrix(X))
+}
+
+# --- Lag features on the open-day sequence (strictly prior days) -----------
+add_lag_features <- function(store_df) {
+  store_df <- store_df %>% arrange(Date)
+  for (k in c(1, 7, 14, 28)) store_df[[paste0("lag", k)]] <- lag(store_df$Sales, k)
+  store_df$roll7_mean  <- lag(rollmeanr(store_df$Sales, 7,  fill = NA), 1)
+  store_df$roll28_mean <- lag(rollmeanr(store_df$Sales, 28, fill = NA), 1)
+  store_df
+}
+```
+
+# 3  Main-holdout predictions (reused by E2 and E4)
+
+One fit per model on the no-lag feature set; row-level predictions are kept.
+
+```{r main-holdout-preds}
+lgbm_s1 <- fit_lgbm(train_df, FEAT_S1)
+xgb_s1  <- fit_xgb(train_df,  FEAT_S1)
+
+holdout <- test_df %>%
+  mutate(
+    pred_dow  = predict_store_dow(train_df, test_df),
+    pred_lgbm = predict_model(lgbm_s1, test_df, FEAT_S1),
+    pred_xgb  = predict_model(xgb_s1,  test_df, FEAT_S1)
+  )
+
+tibble(Model = c("Store-DOW","XGBoost","LightGBM"),
+       RMSE  = c(rmse(holdout$Sales, holdout$pred_dow),
+                 rmse(holdout$Sales, holdout$pred_xgb),
+                 rmse(holdout$Sales, holdout$pred_lgbm)))
+```
+
+# 4  E1 — Fixed-origin recursive 42-day forecast (Stage 3b)
+
+Stage 3 in the main file uses **rolling one-day-ahead** updates: realised
+test-day sales feed later lag features. Here lag features during the holdout
+are filled with the model's **own predictions**, so nothing after the forecast
+origin is observed. The comparison then has three clean points:
+
+1. Stage 1 (no lags, fixed origin) — information baseline,
+2. Stage 3b (lags, fixed origin, recursive) — adds lag *information* only,
+3. Stage 3 (lags, rolling) — additionally adds daily *updating*.
+
+```{r e1-recursive, eval=RUN_E1_RECURSIVE}
+# Train exactly as in Stage 3: actual lags, drop warm-up NA rows
+train_lagged <- train_df %>% group_by(Store) %>% group_modify(~ add_lag_features(.x)) %>%
+  ungroup() %>% drop_na(all_of(c(LAG_COLS, ROLL_COLS)))
+
+lgbm_s3 <- fit_lgbm(train_lagged, FEAT_S3)
+xgb_s3  <- fit_xgb(train_lagged,  FEAT_S3)
+
+# Per-store open-day sales history (train actuals; predictions appended later)
+history <- split(train_df$Sales, train_df$Store)  # named by Store, date-ordered
+
+# Day-by-day recursion over the 42 test dates
+recursive_forecast <- function(model) {
+  hist_local <- history
+  preds <- numeric(nrow(test_df))
+  row_index <- split(seq_len(nrow(test_df)), test_df$Date)  # rows per test date
+
+  for (d in as.character(test_dates)) {
+    idx  <- row_index[[d]]
+    day  <- test_df[idx, ]
+    sid  <- as.character(day$Store)
+    # Lag features from each store's history tail (open-day sequence)
+    lagf <- t(vapply(sid, function(s) {
+      h <- hist_local[[s]]; n <- length(h)
+      c(h[n], h[max(1, n - 6)], h[max(1, n - 13)], h[max(1, n - 27)],
+        mean(h[max(1, n - 6):n]), mean(h[max(1, n - 27):n]))
+    }, numeric(6)))
+    colnames(lagf) <- c(LAG_COLS, ROLL_COLS)
+    X <- cbind(as.matrix(day[, FEAT_S1]), lagf)
+    p <- if (inherits(model, "lgb.Booster")) predict(model, X)
+         else predict(model, xgboost::xgb.DMatrix(X))
+    preds[idx] <- p
+    # Append PREDICTIONS (not actuals) -> fixed-origin recursion
+    for (j in seq_along(sid)) {
+      hist_local[[sid[j]]] <- c(hist_local[[sid[j]]], p[j])
+    }
+  }
+  preds
+}
+
+pred_lgbm_rec <- recursive_forecast(lgbm_s3)
+pred_xgb_rec  <- recursive_forecast(xgb_s3)
+
+e1_results <- tibble(
+  Model  = c("LightGBM", "XGBoost"),
+  `Stage 1 (no lags, fixed origin)` = c(rmse(holdout$Sales, holdout$pred_lgbm),
+                                        rmse(holdout$Sales, holdout$pred_xgb)),
+  `Stage 3b (lags, fixed origin, recursive)` = c(rmse(test_df$Sales, pred_lgbm_rec),
+                                                 rmse(test_df$Sales, pred_xgb_rec))
+)
+e1_results
+write_csv(e1_results, file.path(OUTPUT_DIR, "tab_e1_fixed_origin_recursive.csv"))
+# Interpretation: (Stage1 - Stage3b) = value of lag information at a 42-day
+# horizon; (Stage3b - Stage3 rolling RMSE from the main file) = value of
+# updating forecasts daily as sales are observed.
+```
+
+# 5  E2 — Diebold–Mariano tests
+
+Forecast errors are panel-shaped (1115 stores x 42 days), while `dm.test`
+expects two univariate loss series. Errors are therefore aggregated to **one
+squared-error mean per test day** (42 values per model), which preserves the
+temporal ordering the test requires. Squared-error loss matches the RMSE
+ranking criterion.
+
+```{r e2-dm, eval=RUN_E2_DM_TESTS}
+daily_sq_loss <- function(pred) {
+  tibble(Date = test_df$Date, sq = (test_df$Sales - pred)^2) %>%
+    group_by(Date) %>% summarise(loss = mean(sq), .groups = "drop") %>%
+    arrange(Date) %>% pull(loss)
+}
+
+loss_lgbm <- daily_sq_loss(holdout$pred_lgbm)
+loss_xgb  <- daily_sq_loss(holdout$pred_xgb)
+loss_dow  <- daily_sq_loss(holdout$pred_dow)
+
+dm_pair <- function(l1, l2, label) {
+  # dm.test expects error series; with power = 2 it compares |e|^2.
+  # Passing sqrt(daily mean squared loss) therefore tests exactly the
+  # differential of the daily squared-loss series d_t = l1_t - l2_t.
+  dm <- forecast::dm.test(sqrt(l1), sqrt(l2),
+                          alternative = "two.sided", h = 1, power = 2)
+  tibble(Comparison = label, DM_stat = unname(dm$statistic), p_value = dm$p.value)
+}
+
+e2_results <- bind_rows(
+  dm_pair(loss_lgbm, loss_xgb, "LightGBM vs XGBoost"),
+  dm_pair(loss_lgbm, loss_dow, "LightGBM vs Store-DOW"),
+  dm_pair(loss_xgb,  loss_dow, "XGBoost vs Store-DOW")
+)
+e2_results
+write_csv(e2_results, file.path(OUTPUT_DIR, "tab_e2_dm_tests.csv"))
+```
+
+# 6  E3 — Replication uncertainty for the number-of-stores experiment
+
+Re-runs the N-stores conditions and reports mean **and standard deviation**
+across the five seeds, so the Stage 2 table can carry uncertainty bands.
+
+```{r e3-subset-sd, eval=RUN_E3_SUBSET_SD}
+run_n_stores_once <- function(n_stores, seed) {
+  set.seed(seed)
+  stores  <- sample(unique(df$Store), n_stores)
+  sub     <- df %>% filter(Store %in% stores)
+  tr <- sub %>% filter(Date <= cutoff); te <- sub %>% filter(Date > cutoff)
+  naive <- tr %>% group_by(Store) %>% summarise(p = mean(Sales), .groups="drop")
+  p_naive <- te %>% left_join(naive, by = "Store") %>% pull(p)
+  r_naive <- rmse(te$Sales, p_naive)
+  gain <- function(p) 100 * (r_naive - rmse(te$Sales, p)) / r_naive
+  tibble(N = n_stores, seed = seed,
+         gain_xgb  = gain(predict_model(fit_xgb(tr,  FEAT_S1, seed = seed), te, FEAT_S1)),
+         gain_lgbm = gain(predict_model(fit_lgbm(tr, FEAT_S1, seed = seed), te, FEAT_S1)))
+}
+
+e3_raw <- map_dfr(c(50, 200, 500),
+                  function(n) map_dfr(SEEDS, function(s) run_n_stores_once(n, s)))
+
+e3_results <- e3_raw %>% group_by(N) %>%
+  summarise(across(starts_with("gain"), list(mean = mean, sd = sd)), .groups = "drop")
+e3_results
+write_csv(e3_results, file.path(OUTPUT_DIR, "tab_e3_nstores_sd.csv"))
+```
+
+# 7  E4 — Framework validation: per-store gain vs. predictable variation
+
+The framework predicts `MSE_naive - MSE_tree ≈ Var(delta) * rho^2`: stores
+with more predictable within-store variation should show larger ensemble
+gains. Proxy for `Var(delta)`: the share of each store's within-store training
+variance explained by DayOfWeek x Promo cell means.
+
+```{r e4-framework, eval=RUN_E4_FRAMEWORK}
+# Var(delta) proxy per store, from TRAINING data only
+var_delta <- train_df %>%
+  group_by(Store) %>%
+  mutate(cell_mean = ave(Sales, DayOfWeek, Promo)) %>%
+  summarise(
+    var_total     = var(Sales),
+    var_explained = var(cell_mean),                 # predictable component
+    share_pred    = var_explained / var_total,
+    mean_sales    = mean(Sales), .groups = "drop")
+
+# Per-store RMSE gain of LightGBM over Store-DOW on the holdout
+store_gain <- holdout %>% group_by(Store) %>%
+  summarise(rmse_dow  = rmse(Sales, pred_dow),
+            rmse_lgbm = rmse(Sales, pred_lgbm), .groups = "drop") %>%
+  mutate(gain_pct = 100 * (rmse_dow - rmse_lgbm) / rmse_dow)
+
+e4 <- inner_join(var_delta, store_gain, by = "Store")
+cor_test <- cor.test(e4$var_explained, e4$rmse_dow^2 - e4$rmse_lgbm^2)
+cat("Correlation Var(delta)-proxy vs MSE gain:",
+    round(cor_test$estimate, 3), " p =", format.pval(cor_test$p.value), "\n")
+
+p_framework <- ggplot(e4, aes(var_explained / 1e6, (rmse_dow^2 - rmse_lgbm^2) / 1e6)) +
+  geom_point(alpha = 0.35, size = 1) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.7) +
+  labs(x = "Predictable within-store variance (millions, train)",
+       y = "MSE reduction vs Store-DOW (millions, test)",
+       title = "Framework check: predictable variation vs realised ensemble gain") +
+  theme_minimal(base_size = 11)
+p_framework
+ggsave(file.path(OUTPUT_DIR, "fig_framework_test.pdf"), p_framework,
+       width = 7, height = 4.2)
+write_csv(e4, file.path(OUTPUT_DIR, "tab_e4_store_level_framework.csv"))
+```
+
+# 8  E5 — Hyperparameter sensitivity grid
+
+Is "LightGBM beats XGBoost" robust to capacity choices, or an artefact of
+63 leaves vs. depth 6? No-lag features, primary holdout.
+
+```{r e5-grid, eval=RUN_E5_GRID}
+e5_results <- bind_rows(
+  map_dfr(c(6, 8, 10), function(d) {
+    m <- fit_xgb(train_df, FEAT_S1, max_depth = d)
+    tibble(Model = "XGBoost", Setting = paste0("max_depth = ", d),
+           RMSE = rmse(test_df$Sales, predict_model(m, test_df, FEAT_S1)))
+  }),
+  map_dfr(c(31, 63, 127), function(nl) {
+    m <- fit_lgbm(train_df, FEAT_S1, num_leaves = nl)
+    tibble(Model = "LightGBM", Setting = paste0("num_leaves = ", nl),
+           RMSE = rmse(test_df$Sales, predict_model(m, test_df, FEAT_S1)))
+  })
+)
+e5_results %>% arrange(RMSE)
+write_csv(e5_results, file.path(OUTPUT_DIR, "tab_e5_hyperparameter_grid.csv"))
+```
+
+# 9  E6 — Scale experiment with fixed composition (Type A only)
+
+Prediction 1 (more stores -> larger gain) was rejected, but the mixed subsets
+confound scale with composition. Sampling only Type A stores holds
+composition fixed.
+
+```{r e6-typea, eval=RUN_E6_TYPEA_SCALE}
+stores_a <- df %>% filter(StoreTypeLabel == "A") %>% distinct(Store) %>% pull(Store)
+
+run_typea_once <- function(n_stores, seed) {
+  set.seed(seed)
+  sub <- df %>% filter(Store %in% sample(stores_a, n_stores))
+  tr <- sub %>% filter(Date <= cutoff); te <- sub %>% filter(Date > cutoff)
+  naive <- tr %>% group_by(Store) %>% summarise(p = mean(Sales), .groups="drop")
+  r_naive <- rmse(te$Sales, te %>% left_join(naive, by="Store") %>% pull(p))
+  gain <- function(p) 100 * (r_naive - rmse(te$Sales, p)) / r_naive
+  tibble(N = n_stores, seed = seed,
+         gain_xgb  = gain(predict_model(fit_xgb(tr,  FEAT_S1, seed = seed), te, FEAT_S1)),
+         gain_lgbm = gain(predict_model(fit_lgbm(tr, FEAT_S1, seed = seed), te, FEAT_S1)))
+}
+
+e6_results <- map_dfr(c(50, 200, 500), function(n)
+    map_dfr(SEEDS, function(s) run_typea_once(n, s))) %>%
+  group_by(N) %>%
+  summarise(across(starts_with("gain"), list(mean = mean, sd = sd)), .groups = "drop")
+e6_results
+write_csv(e6_results, file.path(OUTPUT_DIR, "tab_e6_typea_scale.csv"))
+# Compare with E3: if the downward trend disappears here, composition (not
+# scale itself) drove the rejection of Prediction 1.
+```
+
+# 10  E7 — Global vs. local LightGBM
+
+One global model pooled across stores vs. one small LightGBM per store,
+compared on the same random store sample (full 1115 local fits are
+unnecessarily slow; the sample is representative and seeded).
+
+```{r e7-global-local, eval=RUN_E7_GLOBAL_LOCAL}
+set.seed(42)
+sample_stores <- sample(unique(df$Store), N_LOCAL_STORES)
+
+# Global predictions restricted to the sample (reuse Section 3 model)
+glob <- holdout %>% filter(Store %in% sample_stores)
+
+# Local: per-store LightGBM with conservative capacity (small samples)
+local_one <- function(s) {
+  tr <- train_df %>% filter(Store == s); te <- test_df %>% filter(Store == s)
+  if (nrow(te) == 0) return(NULL)
+  feats <- setdiff(FEAT_S1, c("Store","StoreType","Assortment",
+                              "CompetitionDistance","Promo2"))  # store-constant cols dropped
+  m <- lightgbm::lgb.train(
+    params = list(objective = "regression", metric = "rmse", num_leaves = 15,
+                  learning_rate = 0.05, min_data_in_leaf = 20,
+                  num_threads = 1, seed = 42, verbosity = -1),
+    data = lightgbm::lgb.Dataset(as.matrix(tr[, feats]), label = tr$Sales),
+    nrounds = 300, verbose = -1)
+  tibble(Store = s, Sales = te$Sales,
+         pred_local = predict(m, as.matrix(te[, feats])))
+}
+local_preds <- map_dfr(sample_stores, local_one)
+
+e7_results <- tibble(
+  Model = c("Global LightGBM", "Local LightGBM (per store)"),
+  RMSE  = c(rmse(glob$Sales, glob$pred_lgbm),
+            rmse(local_preds$Sales, local_preds$pred_local)),
+  Stores = N_LOCAL_STORES
+)
+e7_results
+write_csv(e7_results, file.path(OUTPUT_DIR, "tab_e7_global_vs_local.csv"))
+```
+
+# 11  E8 — Descriptive statistics and EDA exports
+
+Tables and figures for the new Data section of the thesis.
+
+```{r e8-descriptives}
+# --- Store-type table: counts, Sunday opening, sales level -----------------
+sunday_share <- train_raw %>%
+  left_join(store_raw %>% select(Store, StoreType), by = "Store") %>%
+  filter(DayOfWeek == 7) %>%
+  group_by(StoreType) %>%
+  summarise(sunday_open_share = mean(Open), .groups = "drop")
+
+e8_storetypes <- df %>%
+  group_by(StoreTypeLabel) %>%
+  summarise(N_stores = n_distinct(Store),
+            mean_sales = mean(Sales),
+            dow_var_share = {            # predictable weekly share (pooled proxy)
+              cm <- ave(Sales, Store, DayOfWeek); var(cm) / var(Sales)
+            }, .groups = "drop") %>%
+  left_join(sunday_share %>% mutate(StoreTypeLabel = toupper(StoreType)) %>%
+              select(-StoreType), by = "StoreTypeLabel")
+e8_storetypes
+write_csv(e8_storetypes, file.path(OUTPUT_DIR, "tab_e8_store_types.csv"))
+
+# --- Overall descriptive statistics ----------------------------------------
+e8_summary <- tibble(
+  Statistic = c("Stores", "Open-day observations", "Date range",
+                "Mean daily sales", "Median daily sales", "SD daily sales",
+                "Promo-day share", "School-holiday share"),
+  Value = c(n_distinct(df$Store), nrow(df),
+            paste(min(df$Date), "to", max(df$Date)),
+            round(mean(df$Sales)), round(median(df$Sales)), round(sd(df$Sales)),
+            round(mean(df$Promo), 3), round(mean(df$SchoolHoliday), 3)))
+e8_summary
+write_csv(e8_summary, file.path(OUTPUT_DIR, "tab_e8_descriptives.csv"))
+
+# --- Day-of-week profile figure ---------------------------------------------
+p_dow <- df %>% group_by(DayOfWeek) %>% summarise(m = mean(Sales)) %>%
+  ggplot(aes(factor(DayOfWeek), m)) + geom_col(fill = "steelblue") +
+  labs(x = "Day of week (1 = Monday)", y = "Mean open-day sales (EUR)",
+       title = "Average sales by day of week") + theme_minimal(base_size = 11)
+ggsave(file.path(OUTPUT_DIR, "fig_eda_dow_profile.pdf"), p_dow, width = 6, height = 3.5)
+
+# --- Example store series (one per store type) ------------------------------
+set.seed(42)
+example_stores <- df %>% group_by(StoreTypeLabel) %>%
+  slice_sample(n = 1) %>% pull(Store)
+p_series <- df %>% filter(Store %in% example_stores, Year == 2014) %>%
+  ggplot(aes(Date, Sales)) + geom_line(linewidth = 0.25, colour = "grey30") +
+  facet_wrap(~ paste0("Store ", Store, " (Type ", StoreTypeLabel, ")"),
+             scales = "free_y", ncol = 1) +
+  labs(title = "Example daily sales series, 2014") + theme_minimal(base_size = 10)
+ggsave(file.path(OUTPUT_DIR, "fig_eda_example_series.pdf"), p_series,
+       width = 7, height = 7)
+p_dow; p_series
+```
+
+# 12  Session info
+
+```{r session}
+sessionInfo()
+```

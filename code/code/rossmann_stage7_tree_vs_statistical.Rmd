@@ -1,0 +1,288 @@
+---
+title: "Rossmann Stage 7 — Tree Ensembles vs Statistical Benchmarks, Formally Tested"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_stage7_tree_vs_statistical.Rmd
+  PURPOSE   Stage 7. Refits XGBoost and LightGBM under both feature regimes, fits
+            per-store Auto-ARIMA, and inner-joins all three on (Store, Date) so the
+            Diebold-Mariano tests compare identical evaluation samples.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   rossmann_outputs/tab_stage7_tree_vs_statistical.csv
+            rossmann_outputs/tab_stage7_rmse_check.csv
+  THESIS    Table 18.
+  NOTE      Three chunks are cached, so only the first knit is slow. Auto-ARIMA runs
+            in parallel via mclapply on Unix.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+# Purpose
+
+The thesis text claims a direction reversal: with only a store's own sales
+history (Stage 5, condition 1), Auto-ARIMA beats XGBoost and LightGBM; with
+the full calendar/store/promotion feature set (Stage 1), the boosted models
+beat Auto-ARIMA by a wide margin. Every other significance claim in the
+thesis (Section "Statistical Significance of the Main Comparisons") is backed
+by a Diebold--Mariano test, but this specific claim, tree vs statistical
+benchmark, in each information regime, was never tested. This file closes
+that gap.
+
+**Why a new file instead of extending an existing one.** `rossmann_stage5.Rmd`
+does not retain per-observation predictions (only summary RMSE/MAPE), and it
+does not fit Auto-ARIMA at all — its own comment says "for the Auto-ARIMA
+comparison, use the ARIMA RMSE from the Stage 1 output," which is a *point
+estimate* comparison, not a test. `rossmann_final_comprehensive.Rmd` fits
+Auto-ARIMA (function `run_statistical_benchmarks`) but on the Stage 1
+feature/date alignment, not Stage 5's origin-safe, lag84-trimmed sample. A
+valid paired test needs identical (Store, Date) pairs across every model
+being compared, so this file re-derives that intersection explicitly rather
+than assuming the two pipelines line up.
+
+**Caching.** `xgb-lgb-stage1`, `xgb-lgb-stage5`, and `arima` are the three
+expensive chunks (model training, ~1115-store Auto-ARIMA) and are all cached.
+After the first successful knit, editing anything in Sections 5 onward
+(alignment, the DM tests, the print statements) re-knits in seconds, because
+those downstream chunks are cheap and the expensive ones are read from
+`rossmann_stage7_tree_vs_statistical_cache/` instead of recomputing. If you
+change any code *inside* a cached chunk, only that chunk (and anything after
+it) reruns; unrelated earlier cached chunks are untouched.
+
+# 1. Packages and shared setup
+
+```{r packages}
+library(tidyverse); library(lubridate); library(zoo)
+library(xgboost); library(lightgbm); library(forecast)
+TRAIN_CSV <- "train.csv"; STORE_CSV <- "store.csv"
+N_THREADS <- max(1, parallel::detectCores() - 1)
+TEST_DAYS <- 42; VAL_FRAC <- 0.15; SEED <- 42; set.seed(SEED)
+
+train_raw <- read_csv(TRAIN_CSV, show_col_types = FALSE) %>% mutate(Date = as.Date(Date))
+store_raw <- read_csv(STORE_CSV, show_col_types = FALSE)
+```
+
+# 2. Stage 1 (full-feature) predictions, retained per observation
+
+Rebuilds the Stage 1 feature matrix and refits XGBoost/LightGBM exactly as in
+`rossmann_stage6.Rmd`, but keeps the row-level predictions with `Store` and
+`Date` so they can be joined against Auto-ARIMA later.
+
+```{r stage1-prep}
+df1 <- train_raw %>% filter(Open == 1, Sales > 0) %>% left_join(store_raw, by = "Store") %>%
+  mutate(Year = year(Date), Month = month(Date), Week = isoweek(Date), DayOfMonth = mday(Date),
+         Quarter = quarter(Date), IsWeekend = as.integer(DayOfWeek %in% c(6, 7)),
+         StateHoliday = case_when(StateHoliday == "a" ~ 1L, StateHoliday == "b" ~ 2L,
+                                  StateHoliday == "c" ~ 3L, TRUE ~ 0L),
+         CompetitionOpenMonths = ifelse(!is.na(CompetitionOpenSinceYear) & !is.na(CompetitionOpenSinceMonth),
+           (Year - CompetitionOpenSinceYear) * 12 + (Month - CompetitionOpenSinceMonth), NA_real_),
+         CompetitionOpenMonths = pmax(CompetitionOpenMonths, 0, na.rm = TRUE),
+         StoreType = as.integer(factor(StoreType, levels = c("a", "b", "c", "d"))),
+         Assortment = as.integer(factor(Assortment, levels = c("a", "b", "c")))) %>%
+  select(Store, Date, Sales, DayOfWeek, Promo, StateHoliday, SchoolHoliday, StoreType, Assortment,
+         CompetitionDistance, Promo2, Year, Month, Week, DayOfMonth, Quarter, IsWeekend, CompetitionOpenMonths)
+med1 <- median(df1$CompetitionDistance, na.rm = TRUE)
+df1 <- df1 %>% mutate(CompetitionDistance = replace_na(CompetitionDistance, med1),
+                      CompetitionOpenMonths = replace_na(CompetitionOpenMonths, 0)) %>%
+  arrange(Date, Store)
+
+FEAT_S1 <- c("Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday", "StoreType", "Assortment",
+  "CompetitionDistance", "Promo2", "Year", "Month", "Week", "DayOfMonth", "Quarter", "IsWeekend",
+  "CompetitionOpenMonths")
+
+split_data <- function(data, fc, td = TEST_DAYS) {
+  data <- data %>% arrange(Date, Store); d <- sort(unique(data$Date)); cut <- d[length(d) - td]
+  tr <- data %>% filter(Date <= cut); te <- data %>% filter(Date > cut)
+  list(X_train = as.matrix(tr[, fc]), y_train = tr$Sales, X_test = as.matrix(te[, fc]),
+       y_test = te$Sales, train = tr, test = te)
+}
+val_idx <- function(tr, vf = VAL_FRAC) { d <- sort(unique(tr$Date)); which(tr$Date > d[floor(length(d) * (1 - vf))]) }
+
+fit_xgb <- function(sp) {
+  X <- sp$X_train; y <- sp$y_train; vi <- val_idx(sp$train); ti <- setdiff(seq_along(y), vi)
+  pr <- list(objective = "reg:squarederror", eta = 0.10, max_depth = 6, subsample = 0.8,
+             colsample_bytree = 0.8, nthread = N_THREADS, verbosity = 0)
+  e <- xgb.train(pr, xgb.DMatrix(X[ti, ], label = y[ti]), nrounds = 1500,
+                 watchlist = list(val = xgb.DMatrix(X[vi, ], label = y[vi])),
+                 early_stopping_rounds = 50, verbose = 0)
+  f <- xgb.train(pr, xgb.DMatrix(X, label = y), nrounds = e$best_iteration, verbose = 0)
+  predict(f, xgb.DMatrix(sp$X_test))
+}
+fit_lgb <- function(sp) {
+  X <- sp$X_train; y <- sp$y_train; vi <- val_idx(sp$train); ti <- setdiff(seq_along(y), vi)
+  pr <- list(objective = "regression", metric = "rmse", num_leaves = 63, learning_rate = 0.05,
+             bagging_fraction = 0.8, bagging_freq = 1, feature_fraction = 0.8,
+             num_threads = N_THREADS, seed = SEED, verbosity = -1)
+  e <- lgb.train(pr, lgb.Dataset(X[ti, ], label = y[ti]), nrounds = 2000,
+                 valids = list(val = lgb.Dataset(X[vi, ], label = y[vi])),
+                 early_stopping_rounds = 50, verbose = -1)
+  f <- lgb.train(pr, lgb.Dataset(X, label = y), nrounds = e$best_iter, verbose = -1)
+  predict(f, sp$X_test)
+}
+```
+
+```{r xgb-lgb-stage1, cache=TRUE}
+sp1 <- split_data(df1, FEAT_S1)
+pred_stage1 <- sp1$test %>%
+  transmute(Store, Date, Sales,
+            XGBoost = fit_xgb(sp1),
+            LightGBM = fit_lgb(sp1))
+```
+
+# 3. Stage 5, condition 1 (history only) predictions, retained per observation
+
+Same origin-safe lag construction as `rossmann_stage5.Rmd`; the only change is
+that predictions are kept at the row level instead of collapsed to RMSE.
+
+```{r stage5-prep}
+df0 <- train_raw %>% filter(Open == 1, Sales > 0) %>% left_join(store_raw, by = "Store") %>%
+  mutate(Year = year(Date), Month = month(Date)) %>%
+  select(Store, Date, Sales, Year, Month)
+add_origin_safe <- function(s) {
+  s <- s %>% arrange(Date)
+  s$lag42 <- lag(s$Sales, 42); s$lag49 <- lag(s$Sales, 49)
+  s$lag56 <- lag(s$Sales, 56); s$lag84 <- lag(s$Sales, 84)
+  s$origin_roll7 <- lag(rollmeanr(s$Sales, 7, fill = NA), 42)
+  s$origin_roll28 <- lag(rollmeanr(s$Sales, 28, fill = NA), 42)
+  s
+}
+df5 <- df0 %>% group_by(Store) %>% group_modify(~ add_origin_safe(.x)) %>% ungroup() %>%
+  filter(!is.na(lag84), !is.na(origin_roll28)) %>% arrange(Date, Store)
+HISTORY <- c("Store", "lag42", "lag49", "lag56", "lag84", "origin_roll7", "origin_roll28")
+```
+
+```{r xgb-lgb-stage5, cache=TRUE}
+sp5 <- split_data(df5, HISTORY)
+pred_stage5 <- sp5$test %>%
+  transmute(Store, Date, Sales,
+            XGBoost = fit_xgb(sp5),
+            LightGBM = fit_lgb(sp5))
+```
+
+# 4. Auto-ARIMA on the exact evaluation dates of both regimes
+
+Auto-ARIMA needs only a store's own daily history, so one fit per store
+covers both regimes; what differs is which (Store, Date) rows are scored
+against it, fixed in Section 5 by an inner join.
+
+```{r arima, cache=TRUE}
+eval_stores <- sort(unique(union(pred_stage1$Store, pred_stage5$Store)))
+test_start <- min(pred_stage1$Date, pred_stage5$Date)
+test_end   <- max(pred_stage1$Date, pred_stage5$Date)
+horizon    <- as.integer(test_end - (test_start - days(1)))
+
+train_daily <- train_raw %>% left_join(store_raw, by = "Store") %>%
+  filter(Store %in% eval_stores, Date < test_start) %>% select(Store, Date, Sales)
+
+fit_arima_store <- function(store_id) {
+  d <- train_daily %>% filter(Store == store_id) %>% arrange(Date)
+  calendar <- tibble(Date = seq(min(d$Date), test_start - days(1), by = "day")) %>%
+    left_join(d, by = "Date") %>% mutate(Sales = replace_na(Sales, 0))
+  y <- ts(calendar$Sales, frequency = 7)
+  pred <- tryCatch(
+    as.numeric(forecast::forecast(
+      forecast::auto.arima(y, seasonal = TRUE, stepwise = TRUE, approximation = TRUE,
+                           max.p = 3, max.q = 3, max.P = 1, max.Q = 1, max.order = 5),
+      h = horizon)$mean),
+    error = function(e) rep(mean(y), horizon))
+  tibble(Store = store_id, Date = seq(test_start, test_end, by = "day"), ARIMA = pmax(0, pred))
+}
+pred_arima <- map_dfr(eval_stores, fit_arima_store)
+```
+
+# 5. Aligning the three prediction sets and running the DM tests
+
+Everything from here on is cheap (joins, aggregation, a handful of t-tests),
+so re-knitting after changing only this section reuses the three cached
+chunks above and finishes in seconds.
+
+```{r align}
+regime1 <- pred_stage1 %>% inner_join(pred_arima, by = c("Store", "Date"))
+regime5 <- pred_stage5 %>% inner_join(pred_arima, by = c("Store", "Date"))
+cat(sprintf("Full-feature (Stage 1) aligned rows: %d\nHistory-only (Stage 5) aligned rows: %d\n",
+            nrow(regime1), nrow(regime5)))
+cat(sprintf("Full-feature unique test dates: %d\nHistory-only unique test dates: %d\n",
+            n_distinct(regime1$Date), n_distinct(regime5$Date)))
+```
+
+```{r dm-tests}
+# Same construction as rossmann_stage6.Rmd's E2: daily-aggregated squared
+# error series, dm.test on their square roots (power = 2 compares the
+# original squared-error loss). H0: E[d_t] = 0 (equal expected loss).
+daily_sq <- function(data, model_col) {
+  data %>% mutate(sq = (Sales - .data[[model_col]])^2) %>%
+    group_by(Date) %>% summarise(l = mean(sq), .groups = "drop") %>% arrange(Date) %>% pull(l)
+}
+dm_row <- function(l1, l2, lab) {
+  dm <- dm.test(sqrt(l1), sqrt(l2), alternative = "two.sided", h = 1, power = 2)
+  # NOTE: dm$parameter is NOT the test's degrees of freedom -- dm.test()
+  # returns c(forecasthorizon = h, lossfunctionpower = power) there, i.e. the
+  # h=1/power=2 settings we passed in. The DM statistic's actual reference
+  # distribution is t with (n_days - 1) df; we compute that ourselves.
+  tibble(Comparison = lab, n_days = length(l1), DM = unname(dm$statistic),
+         df = length(l1) - 1, p = dm$p.value)
+}
+
+results_stage7 <- bind_rows(
+  dm_row(daily_sq(regime1, "XGBoost"),  daily_sq(regime1, "ARIMA"),  "Full-feature: XGBoost vs Auto-ARIMA"),
+  dm_row(daily_sq(regime1, "LightGBM"), daily_sq(regime1, "ARIMA"),  "Full-feature: LightGBM vs Auto-ARIMA"),
+  dm_row(daily_sq(regime5, "XGBoost"),  daily_sq(regime5, "ARIMA"),  "History-only: XGBoost vs Auto-ARIMA"),
+  dm_row(daily_sq(regime5, "LightGBM"), daily_sq(regime5, "ARIMA"),  "History-only: LightGBM vs Auto-ARIMA")
+) %>% mutate(p_holm = p.adjust(p, method = "holm"))
+
+rmse_check <- bind_rows(
+  regime1 %>% summarise(Regime = "Full-feature", XGBoost = sqrt(mean((Sales - XGBoost)^2)),
+                        LightGBM = sqrt(mean((Sales - LightGBM)^2)), ARIMA = sqrt(mean((Sales - ARIMA)^2))),
+  regime5 %>% summarise(Regime = "History-only", XGBoost = sqrt(mean((Sales - XGBoost)^2)),
+                        LightGBM = sqrt(mean((Sales - LightGBM)^2)), ARIMA = sqrt(mean((Sales - ARIMA)^2)))
+)
+
+# Plain-text print (not the paged/DataTables widget): avoids any ambiguity in
+# copying numbers out of the rendered HTML, and n_days/df are shown explicitly
+# so the test's effective sample size is checkable at a glance.
+print(as.data.frame(results_stage7), row.names = FALSE)
+print(as.data.frame(rmse_check), row.names = FALSE)
+```
+
+A negative DM statistic means the first-named model (XGBoost or LightGBM) has
+the lower loss; a positive statistic means Auto-ARIMA does. `n_days` is the
+number of daily loss observations the test is run on (should be close to the
+42-day holdout, minus any dates dropped by the inner join), and `df` is
+`dm.test`'s reported degrees of freedom, `n_days - 1` for `h = 1`; if `df` is
+much smaller than `n_days - 1`, that is a sign something upstream (most
+likely a `Date` mismatch in the join) silently dropped observations and the
+test should not be trusted before that is fixed. Read together with
+`rmse_check`, this is the formal version of the thesis's qualitative claim:
+it should show a significant XGBoost/LightGBM advantage in the full-feature
+row and a significant Auto-ARIMA advantage in the history-only row, matching
+Table stage5's point estimates (XGBoost 1843, LightGBM 1852, Auto-ARIMA 1508
+on history-only; XGBoost 1003, LightGBM 1013, Auto-ARIMA 1508 on the full
+feature set) but now with a $p$-value attached to each claim rather than just
+an RMSE gap.
+
+```{r save}
+write_csv(results_stage7, "rossmann_outputs/tab_stage7_tree_vs_statistical.csv")
+# Written for the thesis: Table 18 (Diebold-Mariano tests, trees against the
+# statistical benchmarks).
+dir.create("thesis_tables", showWarnings = FALSE)
+write_csv(results_stage7, "thesis_tables/stage7_dm_tests.csv")
+write_csv(rmse_check, "rossmann_outputs/tab_stage7_rmse_check.csv")
+```
+
+```{r session}
+sessionInfo()
+```

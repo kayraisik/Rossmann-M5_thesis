@@ -1,0 +1,1077 @@
+---
+title: "From Old-M-Style Forecasting to Modern Retail Machine Learning"
+author: "Kayra Isik"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_old_m_to_modern_ml_experiment.Rmd
+  PURPOSE   Sets up the comparison between old-M-competition style statistical
+            forecasting and modern machine learning. Fits Auto-ARIMA, ETS and Theta
+            per store.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   old_m_to_modern_ml_outputs/benchmark_results.csv and five further CSVs
+  THESIS    Table 11, rows Auto-ARIMA (1508), Theta (1618) and ETS (1709). The two
+            naive baselines are also computed here and agree with Stage 1.
+  NOTE      The incremental-information part of this file is exploratory and does not
+            feed the thesis. Only benchmark_results.csv does.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,
+  cache.lazy = FALSE,
+  fig.align = "center"
+)
+set.seed(42)
+```
+
+# 1. Purpose of the experiment
+
+This experiment asks when modern tree-based machine-learning methods begin to
+outperform forecasting approaches that resemble the information environment of
+the earlier M competitions.
+
+The comparison starts with information derived only from a store's own sales
+history. It then adds information in stages:
+
+1. origin-safe sales-history features;
+2. calendar information;
+3. store and competition attributes;
+4. promotion and holiday information.
+
+The same stores, training period, 42-day fixed-origin test period, model
+settings, and evaluation metrics are retained at every stage. Consequently,
+changes in performance can be attributed to the newly available information
+rather than to a different sample or forecast horizon.
+
+Unlike a rolling one-day-ahead design, no realised sales from the 42-day test
+period are used to construct predictors. The shortest sales lag is therefore
+42 calendar days. This makes every feature available at the common forecast
+origin.
+
+# 2. Packages and configuration
+
+```{r packages}
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(xgboost)
+library(lightgbm)
+library(forecast)
+
+DATA_DIR <- "/home/whu/isik.kayra/projects"
+TRAIN_CSV <- file.path(DATA_DIR, "train.csv")
+STORE_CSV <- file.path(DATA_DIR, "store.csv")
+
+OUTPUT_DIR <- "old_m_to_modern_ml_outputs"
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+TEST_DAYS <- 42L
+CV_FOLDS <- 3L
+XGB_MAX_ROUNDS <- 300L
+LGB_MAX_ROUNDS <- 1000L
+XGB_EARLY_STOP <- 20L
+LGB_EARLY_STOP <- 40L
+DETECTED_CORES <- parallel::detectCores()
+if (is.na(DETECTED_CORES)) DETECTED_CORES <- 2L
+N_THREADS <- max(1L, DETECTED_CORES - 1L)
+STAT_WORKERS <- min(8L, N_THREADS)
+SAVE_PREDICTIONS <- FALSE
+
+cat("Threads:", N_THREADS, "\n")
+cat("Statistical workers:", STAT_WORKERS, "\n")
+cat("Test horizon:", TEST_DAYS, "calendar days\n")
+```
+
+# 3. Data preparation
+
+```{r load-data}
+train_raw <- read_csv(
+  TRAIN_CSV,
+  col_types = cols(
+    Store = col_integer(),
+    DayOfWeek = col_integer(),
+    Date = col_date(format = "%Y-%m-%d"),
+    Sales = col_double(),
+    Customers = col_double(),
+    Open = col_integer(),
+    Promo = col_integer(),
+    StateHoliday = col_character(),
+    SchoolHoliday = col_integer()
+  )
+)
+
+store_raw <- read_csv(
+  STORE_CSV,
+  col_types = cols(
+    Store = col_integer(),
+    StoreType = col_character(),
+    Assortment = col_character(),
+    CompetitionDistance = col_double(),
+    CompetitionOpenSinceMonth = col_double(),
+    CompetitionOpenSinceYear = col_double(),
+    Promo2 = col_integer(),
+    Promo2SinceWeek = col_double(),
+    Promo2SinceYear = col_double(),
+    PromoInterval = col_character()
+  )
+)
+```
+
+Sales-history features are constructed on a complete daily calendar. Closed
+days are represented by zero sales so that a 42-day lag always means 42
+calendar days. Model accuracy is still evaluated only on open days with
+positive sales, matching the main thesis analysis.
+
+```{r complete-calendar}
+date_range <- seq(min(train_raw$Date), max(train_raw$Date), by = "day")
+store_ids <- sort(unique(train_raw$Store))
+
+calendar_sales <- tidyr::expand_grid(
+  Store = store_ids,
+  Date = date_range
+) %>%
+  left_join(
+    train_raw %>%
+      select(Store, Date, Sales, Open, Promo, StateHoliday, SchoolHoliday),
+    by = c("Store", "Date")
+  ) %>%
+  mutate(
+    Open = replace_na(Open, 0L),
+    Sales = if_else(Open == 1L, replace_na(Sales, 0), 0),
+    Promo = replace_na(Promo, 0L),
+    StateHoliday = replace_na(StateHoliday, "0"),
+    SchoolHoliday = replace_na(SchoolHoliday, 0L)
+  ) %>%
+  arrange(Store, Date)
+```
+
+```{r origin-safe-history}
+add_origin_safe_history <- function(x) {
+  x <- x %>% arrange(Date)
+
+  x$lag42 <- dplyr::lag(x$Sales, 42)
+  x$lag49 <- dplyr::lag(x$Sales, 49)
+  x$lag56 <- dplyr::lag(x$Sales, 56)
+  x$lag84 <- dplyr::lag(x$Sales, 84)
+
+  roll7 <- zoo::rollmeanr(x$Sales, 7, fill = NA)
+  roll28 <- zoo::rollmeanr(x$Sales, 28, fill = NA)
+  x$origin_roll7 <- dplyr::lag(roll7, 42)
+  x$origin_roll28 <- dplyr::lag(roll28, 42)
+
+  x
+}
+
+calendar_sales <- calendar_sales %>%
+  group_by(Store) %>%
+  group_modify(~ add_origin_safe_history(.x)) %>%
+  ungroup()
+```
+
+```{r model-frame}
+df <- calendar_sales %>%
+  left_join(store_raw, by = "Store") %>%
+  mutate(
+    DayOfWeek = wday(Date, week_start = 1),
+    Year = year(Date),
+    Month = month(Date),
+    Week = isoweek(Date),
+    DayOfMonth = mday(Date),
+    Quarter = quarter(Date),
+    IsWeekend = as.integer(DayOfWeek %in% c(6, 7)),
+    ForecastTrend = as.integer(Date - min(Date)),
+    StateHoliday = case_when(
+      StateHoliday == "0" ~ 0L,
+      StateHoliday == "a" ~ 1L,
+      StateHoliday == "b" ~ 2L,
+      StateHoliday == "c" ~ 3L,
+      TRUE ~ 0L
+    ),
+    StoreType = as.integer(factor(StoreType, levels = c("a", "b", "c", "d"))),
+    Assortment = as.integer(factor(Assortment, levels = c("a", "b", "c"))),
+    CompetitionOpenMonths = if_else(
+      !is.na(CompetitionOpenSinceYear) &
+        !is.na(CompetitionOpenSinceMonth),
+      (Year - CompetitionOpenSinceYear) * 12 +
+        (Month - CompetitionOpenSinceMonth),
+      0
+    ),
+    CompetitionOpenMonths = pmax(CompetitionOpenMonths, 0),
+    CompetitionDistance = replace_na(
+      CompetitionDistance,
+      median(CompetitionDistance, na.rm = TRUE)
+    ),
+    Promo2 = replace_na(Promo2, 0L)
+  ) %>%
+  filter(Open == 1L, Sales > 0) %>%
+  arrange(Date, Store)
+
+all_dates <- sort(unique(df$Date))
+test_start <- all_dates[length(all_dates) - TEST_DAYS + 1L]
+test_end <- max(all_dates)
+forecast_origin <- test_start - days(1)
+
+df <- df %>%
+  mutate(
+    Horizon = if_else(
+      Date >= test_start,
+      as.integer(Date - forecast_origin),
+      0L
+    )
+  )
+
+cat("Open-day rows:", nrow(df), "\n")
+cat("Stores:", n_distinct(df$Store), "\n")
+cat("Forecast origin:", as.character(forecast_origin), "\n")
+cat("Test period:", as.character(test_start), "to", as.character(test_end), "\n")
+```
+
+# 4. Incremental information sets
+
+The first feature set approximates an old-M-style information environment:
+the model receives only store identity and lagged summaries of the store's own
+sales history. The other feature sets add groups of information while retaining
+all earlier features.
+
+```{r feature-sets}
+HISTORY_FEATURES <- c(
+  "Store",
+  "lag42", "lag49", "lag56", "lag84",
+  "origin_roll7", "origin_roll28"
+)
+
+CALENDAR_FEATURES <- c(
+  "DayOfWeek", "Month", "Week", "DayOfMonth",
+  "Quarter", "IsWeekend", "Year", "ForecastTrend"
+)
+
+STORE_FEATURES <- c(
+  "StoreType", "Assortment",
+  "CompetitionDistance", "CompetitionOpenMonths"
+)
+
+COMMERCIAL_FEATURES <- c(
+  "Promo", "Promo2", "StateHoliday", "SchoolHoliday"
+)
+
+FEATURE_STAGES <- list(
+  "1 History only" = HISTORY_FEATURES,
+  "2 + Calendar" = c(HISTORY_FEATURES, CALENDAR_FEATURES),
+  "3 + Store attributes" = c(
+    HISTORY_FEATURES, CALENDAR_FEATURES, STORE_FEATURES
+  ),
+  "4 + Promotions and holidays" = c(
+    HISTORY_FEATURES, CALENDAR_FEATURES,
+    STORE_FEATURES, COMMERCIAL_FEATURES
+  )
+)
+
+feature_stage_table <- imap_dfr(
+  FEATURE_STAGES,
+  ~ tibble(
+    Stage = .y,
+    N_features = length(.x),
+    Features = paste(.x, collapse = ", ")
+  )
+)
+
+print(feature_stage_table, n = Inf, width = Inf)
+```
+
+# 5. Split, metrics, and validation helpers
+
+```{r helpers}
+rmse <- function(actual, pred) sqrt(mean((actual - pred)^2))
+mae <- function(actual, pred) mean(abs(actual - pred))
+mape <- function(actual, pred) {
+  valid <- !is.na(actual) & actual != 0
+  mean(abs((actual[valid] - pred[valid]) / actual[valid])) * 100
+}
+r2_test <- function(actual, pred) {
+  denom <- sum((actual - mean(actual))^2)
+  if (denom == 0) return(NA_real_)
+  1 - sum((actual - pred)^2) / denom
+}
+improvement <- function(reference_rmse, model_rmse) {
+  100 * (reference_rmse - model_rmse) / reference_rmse
+}
+evaluate <- function(actual, pred) {
+  tibble(
+    RMSE = rmse(actual, pred),
+    MAE = mae(actual, pred),
+    MAPE = mape(actual, pred),
+    R2_test = r2_test(actual, pred)
+  )
+}
+
+make_split <- function(data, features) {
+  required <- c(features, "Sales", "Date", "Store", "DayOfWeek")
+  clean <- data %>%
+    filter(if_all(all_of(features), ~ !is.na(.x))) %>%
+    arrange(Date, Store)
+
+  train <- clean %>% filter(Date < test_start)
+  test <- clean %>% filter(Date >= test_start, Date <= test_end)
+
+  list(
+    train = train,
+    test = test,
+    X_train = as.matrix(train[, features]),
+    y_train = train$Sales,
+    X_test = as.matrix(test[, features]),
+    y_test = test$Sales
+  )
+}
+
+make_temporal_folds <- function(data, k = CV_FOLDS) {
+  dates <- sort(unique(data$Date))
+  boundaries <- floor(seq(
+    length(dates) / (k + 1),
+    length(dates) * k / (k + 1),
+    length.out = k
+  ))
+
+  lapply(boundaries, function(boundary) {
+    train_dates <- dates[seq_len(boundary)]
+    val_end <- min(length(dates), boundary + floor(length(dates) / (k + 1)))
+    val_dates <- dates[(boundary + 1L):val_end]
+    list(
+      train = which(data$Date %in% train_dates),
+      val = which(data$Date %in% val_dates)
+    )
+  })
+}
+```
+
+# 6. Benchmarks
+
+Store-mean and Store-DOW are recalculated on the same modelling sample used by
+the feature stages. Auto-ARIMA, ETS, and Theta are fitted once on the common
+primary holdout because their information set does not change across the ML
+stages.
+
+```{r simple-benchmarks}
+benchmark_split <- make_split(df, FEATURE_STAGES[[1]])
+benchmark_train <- df %>% filter(Date < test_start)
+
+store_mean_lookup <- benchmark_train %>%
+  group_by(Store) %>%
+  summarise(Prediction = mean(Sales), .groups = "drop")
+
+store_dow_lookup <- benchmark_train %>%
+  group_by(Store, DayOfWeek) %>%
+  summarise(Prediction = mean(Sales), .groups = "drop")
+
+store_fallback <- benchmark_train %>%
+  group_by(Store) %>%
+  summarise(StoreMean = mean(Sales), .groups = "drop")
+
+global_mean <- mean(benchmark_train$Sales)
+
+pred_store_mean <- benchmark_split$test %>%
+  left_join(store_mean_lookup, by = "Store") %>%
+  mutate(Prediction = replace_na(Prediction, global_mean)) %>%
+  pull(Prediction)
+
+pred_store_dow <- benchmark_split$test %>%
+  left_join(store_dow_lookup, by = c("Store", "DayOfWeek")) %>%
+  left_join(store_fallback, by = "Store") %>%
+  mutate(Prediction = coalesce(Prediction, StoreMean, global_mean)) %>%
+  pull(Prediction)
+
+simple_benchmarks <- bind_rows(
+  evaluate(benchmark_split$y_test, pred_store_mean) %>%
+    mutate(Model = "Store-mean", .before = 1),
+  evaluate(benchmark_split$y_test, pred_store_dow) %>%
+    mutate(Model = "Store-DOW", .before = 1)
+)
+
+print(simple_benchmarks)
+```
+
+```{r statistical-benchmarks}
+run_statistical_benchmarks <- function(train_daily, test_open,
+                                       workers = STAT_WORKERS) {
+  horizon <- as.integer(test_end - forecast_origin)
+  stores <- sort(unique(test_open$Store))
+
+  fit_one_store <- function(store_id) {
+    observed <- train_daily %>%
+      filter(Store == store_id, Date <= forecast_origin) %>%
+      select(Date, Sales)
+
+    complete <- tibble(
+      Date = seq(min(observed$Date), forecast_origin, by = "day")
+    ) %>%
+      left_join(observed, by = "Date") %>%
+      mutate(Sales = replace_na(Sales, 0))
+
+    y <- ts(complete$Sales, frequency = 7)
+
+    safe_fit <- function(expr) {
+      tryCatch(
+        as.numeric(expr),
+        error = function(e) rep(NA_real_, horizon)
+      )
+    }
+
+    arima_pred <- safe_fit(
+      forecast(
+        auto.arima(
+          y,
+          seasonal = TRUE,
+          stepwise = TRUE,
+          approximation = TRUE,
+          max.p = 3, max.q = 3,
+          max.P = 1, max.Q = 1,
+          max.order = 5
+        ),
+        h = horizon
+      )$mean
+    )
+    ets_pred <- safe_fit(forecast(ets(y), h = horizon)$mean)
+    theta_pred <- safe_fit(thetaf(y, h = horizon)$mean)
+
+    forecast_tbl <- tibble(
+      Store = store_id,
+      Date = seq(test_start, test_end, by = "day"),
+      ARIMA = pmax(0, arima_pred),
+      ETS = pmax(0, ets_pred),
+      Theta = pmax(0, theta_pred)
+    )
+
+    test_open %>%
+      filter(Store == store_id) %>%
+      select(Store, Date, Sales) %>%
+      left_join(forecast_tbl, by = c("Store", "Date"))
+  }
+
+  parts <- if (.Platform$OS.type == "unix" && workers > 1L) {
+    parallel::mclapply(
+      stores, fit_one_store,
+      mc.cores = workers,
+      mc.preschedule = TRUE
+    )
+  } else {
+    lapply(stores, fit_one_store)
+  }
+
+  predictions <- bind_rows(parts)
+
+  if (anyNA(predictions[, c("ARIMA", "ETS", "Theta")])) {
+    stop("At least one statistical model failed. Inspect predictions.")
+  }
+
+  metrics <- map_dfr(c("ARIMA", "ETS", "Theta"), function(model) {
+    evaluate(predictions$Sales, predictions[[model]]) %>%
+      mutate(Model = model, .before = 1)
+  })
+
+  list(metrics = metrics, predictions = predictions)
+}
+
+statistical_obj <- run_statistical_benchmarks(
+  train_daily = calendar_sales,
+  test_open = benchmark_split$test
+)
+statistical_benchmarks <- statistical_obj$metrics
+print(statistical_benchmarks)
+```
+
+```{r benchmark-summary}
+all_benchmarks <- bind_rows(simple_benchmarks, statistical_benchmarks) %>%
+  arrange(RMSE)
+
+best_statistical <- statistical_benchmarks %>%
+  slice_min(RMSE, n = 1, with_ties = FALSE)
+
+store_dow_rmse <- simple_benchmarks$RMSE[
+  simple_benchmarks$Model == "Store-DOW"
+]
+best_stat_rmse <- best_statistical$RMSE
+best_stat_name <- best_statistical$Model
+
+cat("Best statistical benchmark:", best_stat_name, "\n")
+print(all_benchmarks, n = Inf, width = Inf)
+```
+
+# 7. XGBoost and LightGBM
+
+```{r boosted-functions-v2}
+xgb_train_with_validation <- function(params, data, nrounds, validation,
+                                      early_stopping_rounds, verbose = 0) {
+  train_args <- list(
+    params = params,
+    data = data,
+    nrounds = nrounds,
+    early_stopping_rounds = early_stopping_rounds,
+    verbose = verbose
+  )
+
+  # xgboost < 2 uses `watchlist`; newer releases renamed it to `evals`.
+  if ("evals" %in% names(formals(xgboost::xgb.train))) {
+    train_args$evals <- list(validation = validation)
+  } else {
+    train_args$watchlist <- list(validation = validation)
+  }
+
+  do.call(xgboost::xgb.train, train_args)
+}
+
+run_xgboost <- function(split, seed = 42) {
+  folds <- make_temporal_folds(split$train)
+
+  best_rounds <- map_int(folds, function(fold) {
+    dtrain <- xgb.DMatrix(
+      split$X_train[fold$train, , drop = FALSE],
+      label = split$y_train[fold$train]
+    )
+    dval <- xgb.DMatrix(
+      split$X_train[fold$val, , drop = FALSE],
+      label = split$y_train[fold$val]
+    )
+
+    fit <- xgb_train_with_validation(
+      params = list(
+        objective = "reg:squarederror",
+        eta = 0.1,
+        max_depth = 6,
+        subsample = 0.8,
+        colsample_bytree = 0.8,
+        nthread = N_THREADS,
+        seed = seed,
+        verbosity = 0
+      ),
+      data = dtrain,
+      nrounds = XGB_MAX_ROUNDS,
+      validation = dval,
+      early_stopping_rounds = XGB_EARLY_STOP,
+      verbose = 0
+    )
+    if (length(fit$best_iteration) == 0L || is.na(fit$best_iteration)) {
+      XGB_MAX_ROUNDS
+    } else {
+      fit$best_iteration
+    }
+  })
+
+  final_rounds <- round(mean(best_rounds))
+  dtrain <- xgb.DMatrix(split$X_train, label = split$y_train)
+  dtest <- xgb.DMatrix(split$X_test)
+
+  fit <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      eta = 0.1,
+      max_depth = 6,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      nthread = N_THREADS,
+      seed = seed,
+      verbosity = 0
+    ),
+    data = dtrain,
+    nrounds = final_rounds,
+    verbose = 0
+  )
+
+  pred <- predict(fit, dtest)
+  list(
+    metrics = evaluate(split$y_test, pred),
+    model = fit,
+    predictions = pred,
+    rounds = final_rounds
+  )
+}
+
+run_lightgbm <- function(split, seed = 42) {
+  folds <- make_temporal_folds(split$train)
+
+  best_rounds <- map_int(folds, function(fold) {
+    dtrain <- lgb.Dataset(
+      split$X_train[fold$train, , drop = FALSE],
+      label = split$y_train[fold$train]
+    )
+    dval <- lgb.Dataset(
+      split$X_train[fold$val, , drop = FALSE],
+      label = split$y_train[fold$val]
+    )
+
+    fit <- lgb.train(
+      params = list(
+        objective = "regression",
+        metric = "rmse",
+        num_leaves = 63,
+        learning_rate = 0.05,
+        bagging_fraction = 0.8,
+        bagging_freq = 1,
+        feature_fraction = 0.8,
+        num_threads = N_THREADS,
+        seed = seed,
+        bagging_seed = seed,
+        feature_fraction_seed = seed,
+        verbosity = -1
+      ),
+      data = dtrain,
+      nrounds = LGB_MAX_ROUNDS,
+      valids = list(validation = dval),
+      early_stopping_rounds = LGB_EARLY_STOP,
+      verbose = -1
+    )
+    if (length(fit$best_iter) == 0L ||
+        is.na(fit$best_iter) ||
+        fit$best_iter <= 0L) {
+      LGB_MAX_ROUNDS
+    } else {
+      fit$best_iter
+    }
+  })
+
+  final_rounds <- round(mean(best_rounds))
+  dtrain <- lgb.Dataset(split$X_train, label = split$y_train)
+
+  fit <- lgb.train(
+    params = list(
+      objective = "regression",
+      metric = "rmse",
+      num_leaves = 63,
+      learning_rate = 0.05,
+      bagging_fraction = 0.8,
+      bagging_freq = 1,
+      feature_fraction = 0.8,
+      num_threads = N_THREADS,
+      seed = seed,
+      bagging_seed = seed,
+      feature_fraction_seed = seed,
+      verbosity = -1
+    ),
+    data = dtrain,
+    nrounds = final_rounds,
+    verbose = -1
+  )
+
+  pred <- predict(fit, split$X_test)
+  list(
+    metrics = evaluate(split$y_test, pred),
+    model = fit,
+    predictions = pred,
+    rounds = final_rounds
+  )
+}
+```
+
+# 8. Incremental feature experiment
+
+```{r run-feature-stages-v2}
+stage_objects <- list()
+
+stage_results <- imap_dfr(FEATURE_STAGES, function(features, stage_name) {
+  cat("\nRunning:", stage_name, "\n")
+  split <- make_split(df, features)
+
+  xgb_obj <- run_xgboost(split, seed = 42)
+  lgb_obj <- run_lightgbm(split, seed = 42)
+
+  stage_objects[[stage_name]] <<- list(
+    split = split,
+    XGBoost = xgb_obj,
+    LightGBM = lgb_obj,
+    features = features
+  )
+
+  bind_rows(
+    xgb_obj$metrics %>%
+      mutate(Model = "XGBoost", Rounds = xgb_obj$rounds, .before = 1),
+    lgb_obj$metrics %>%
+      mutate(Model = "LightGBM", Rounds = lgb_obj$rounds, .before = 1)
+  ) %>%
+    mutate(
+      Stage = stage_name,
+      N_features = length(features),
+      N_train = nrow(split$train),
+      N_test = nrow(split$test),
+      .before = 1
+    )
+})
+
+stage_results <- stage_results %>%
+  mutate(
+    Improvement_vs_StoreDOW = improvement(store_dow_rmse, RMSE),
+    Improvement_vs_BestStat = improvement(best_stat_rmse, RMSE),
+    Beats_StoreDOW = RMSE < store_dow_rmse,
+    Beats_BestStat = RMSE < best_stat_rmse
+  )
+
+print(stage_results, n = Inf, width = Inf)
+
+stage_predictions <- imap_dfr(stage_objects, function(objects, stage_name) {
+  bind_rows(
+    objects$split$test %>%
+      transmute(
+        Stage = stage_name,
+        Model = "XGBoost",
+        Store, Date, Actual = Sales,
+        Prediction = objects$XGBoost$predictions
+      ),
+    objects$split$test %>%
+      transmute(
+        Stage = stage_name,
+        Model = "LightGBM",
+        Store, Date, Actual = Sales,
+        Prediction = objects$LightGBM$predictions
+      )
+  )
+})
+```
+
+# 9. When does machine learning overtake the benchmarks?
+
+```{r transition-analysis}
+stage_levels <- names(FEATURE_STAGES)
+
+transition_table <- stage_results %>%
+  mutate(Stage = factor(Stage, levels = stage_levels)) %>%
+  arrange(Model, Stage) %>%
+  group_by(Model) %>%
+  summarise(
+    First_stage_beating_StoreDOW = if (any(Beats_StoreDOW)) {
+      as.character(Stage[which(Beats_StoreDOW)[1]])
+    } else {
+      "Never"
+    },
+    First_stage_beating_best_statistical = if (any(Beats_BestStat)) {
+      as.character(Stage[which(Beats_BestStat)[1]])
+    } else {
+      "Never"
+    },
+    Best_stage = as.character(Stage[which.min(RMSE)]),
+    Best_RMSE = min(RMSE),
+    .groups = "drop"
+  )
+
+cat("\nBest statistical model:", best_stat_name,
+    "with RMSE", round(best_stat_rmse, 1), "\n")
+print(transition_table, n = Inf, width = Inf)
+```
+
+```{r incremental-gains}
+incremental_results <- stage_results %>%
+  mutate(Stage = factor(Stage, levels = stage_levels)) %>%
+  arrange(Model, Stage) %>%
+  group_by(Model) %>%
+  mutate(
+    Previous_RMSE = lag(RMSE),
+    Incremental_RMSE_reduction = Previous_RMSE - RMSE,
+    Incremental_improvement_pct = 100 *
+      (Previous_RMSE - RMSE) / Previous_RMSE
+  ) %>%
+  ungroup()
+
+print(
+  incremental_results %>%
+    select(
+      Stage, Model, RMSE, Previous_RMSE,
+      Incremental_RMSE_reduction, Incremental_improvement_pct,
+      Beats_StoreDOW, Beats_BestStat
+    ),
+  n = Inf,
+  width = Inf
+)
+```
+
+# 10. Visual results
+
+```{r plot-rmse-path, fig.width=9, fig.height=5}
+benchmark_lines <- tibble(
+  Benchmark = c("Store-DOW", best_stat_name),
+  RMSE = c(store_dow_rmse, best_stat_rmse)
+)
+
+p_rmse_path <- stage_results %>%
+  mutate(Stage = factor(Stage, levels = stage_levels)) %>%
+  ggplot(aes(Stage, RMSE, colour = Model, group = Model)) +
+  geom_hline(
+    data = benchmark_lines,
+    aes(yintercept = RMSE, linetype = Benchmark),
+    colour = "#555555",
+    linewidth = 0.8
+  ) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3) +
+  geom_text(
+    aes(label = round(RMSE)),
+    vjust = -0.8,
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(values = c(
+    "XGBoost" = "#3F82E0",
+    "LightGBM" = "#E96B5F"
+  )) +
+  labs(
+    title = "When does machine learning overtake the benchmarks?",
+    subtitle = paste0(
+      "Fixed-origin 42-day forecasts; best statistical benchmark is ",
+      best_stat_name
+    ),
+    x = "Information available to the global ML model",
+    y = "RMSE",
+    colour = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1),
+    legend.position = "bottom"
+  )
+
+p_rmse_path
+```
+
+```{r plot-benchmark-improvement, fig.width=9, fig.height=5}
+p_improvement <- stage_results %>%
+  mutate(Stage = factor(Stage, levels = stage_levels)) %>%
+  select(Stage, Model, Improvement_vs_StoreDOW, Improvement_vs_BestStat) %>%
+  pivot_longer(
+    cols = starts_with("Improvement"),
+    names_to = "Benchmark",
+    values_to = "Improvement"
+  ) %>%
+  mutate(
+    Benchmark = recode(
+      Benchmark,
+      "Improvement_vs_StoreDOW" = "Store-DOW",
+      "Improvement_vs_BestStat" = paste0("Best statistical: ", best_stat_name)
+    )
+  ) %>%
+  ggplot(aes(Stage, Improvement, colour = Model, group = Model)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.8) +
+  facet_wrap(~ Benchmark) +
+  scale_colour_manual(values = c(
+    "XGBoost" = "#3F82E0",
+    "LightGBM" = "#E96B5F"
+  )) +
+  labs(
+    title = "Improvement created by each information stage",
+    subtitle = "Positive values indicate lower RMSE than the benchmark",
+    x = NULL,
+    y = "RMSE improvement (%)",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "bottom"
+  )
+
+p_improvement
+```
+
+```{r plot-incremental-gain, fig.width=9, fig.height=5}
+p_incremental <- incremental_results %>%
+  filter(!is.na(Incremental_improvement_pct)) %>%
+  mutate(Stage = factor(Stage, levels = stage_levels)) %>%
+  ggplot(aes(Stage, Incremental_improvement_pct, fill = Model)) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.68) +
+  scale_fill_manual(values = c(
+    "XGBoost" = "#3F82E0",
+    "LightGBM" = "#E96B5F"
+  )) +
+  labs(
+    title = "Marginal value of each newly added information group",
+    subtitle = "Percentage RMSE reduction relative to the preceding stage",
+    x = NULL,
+    y = "Incremental RMSE reduction (%)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1),
+    legend.position = "bottom"
+  )
+
+p_incremental
+```
+
+# 11. Feature importance in the final specification
+
+```{r final-importance}
+final_stage <- tail(stage_levels, 1)
+final_obj <- stage_objects[[final_stage]]
+
+xgb_importance <- xgb.importance(
+  feature_names = final_obj$features,
+  model = final_obj$XGBoost$model
+) %>%
+  as_tibble() %>%
+  transmute(Feature, Gain, Model = "XGBoost")
+
+lgb_importance <- lgb.importance(final_obj$LightGBM$model) %>%
+  as_tibble() %>%
+  transmute(Feature, Gain, Model = "LightGBM")
+
+importance_all <- bind_rows(xgb_importance, lgb_importance) %>%
+  mutate(
+    InformationGroup = case_when(
+      Feature %in% HISTORY_FEATURES ~ "Sales history",
+      Feature %in% CALENDAR_FEATURES ~ "Calendar",
+      Feature %in% STORE_FEATURES ~ "Store/competition",
+      Feature %in% COMMERCIAL_FEATURES ~ "Promotion/holiday",
+      TRUE ~ "Other"
+    )
+  )
+
+importance_groups <- importance_all %>%
+  group_by(Model, InformationGroup) %>%
+  summarise(Gain = sum(Gain), .groups = "drop") %>%
+  group_by(Model) %>%
+  mutate(GainShare = Gain / sum(Gain)) %>%
+  ungroup()
+
+print(importance_groups, n = Inf, width = Inf)
+```
+
+```{r plot-importance-groups, fig.width=8, fig.height=4.5}
+p_importance_groups <- importance_groups %>%
+  ggplot(aes(InformationGroup, GainShare * 100, fill = Model)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c(
+    "XGBoost" = "#3F82E0",
+    "LightGBM" = "#E96B5F"
+  )) +
+  labs(
+    title = "Information used by the final ML specifications",
+    x = NULL,
+    y = "Share of total gain importance (%)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1),
+    legend.position = "bottom"
+  )
+
+p_importance_groups
+```
+
+# 12. Direct interpretation
+
+```{r automatic-interpretation, results='asis'}
+cat("## Automatic answer\n\n")
+
+walk(seq_len(nrow(transition_table)), function(i) {
+  row <- transition_table[i, ]
+  cat(
+    "**", row$Model, "** first beats Store-DOW at **",
+    row$First_stage_beating_StoreDOW,
+    "** and first beats the best statistical model (",
+    best_stat_name, ") at **",
+    row$First_stage_beating_best_statistical,
+    "**. Its lowest RMSE is ",
+    round(row$Best_RMSE, 1),
+    " at **", row$Best_stage, "**.\n\n",
+    sep = ""
+  )
+})
+
+largest_additions <- incremental_results %>%
+  filter(!is.na(Incremental_improvement_pct)) %>%
+  group_by(Model) %>%
+  slice_max(Incremental_improvement_pct, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+walk(seq_len(nrow(largest_additions)), function(i) {
+  row <- largest_additions[i, ]
+  cat(
+    "The largest incremental improvement for **", row$Model,
+    "** occurs at **", as.character(row$Stage),
+    "**, reducing RMSE by ",
+    sprintf("%.1f", row$Incremental_improvement_pct),
+    "\\% relative to the preceding information set.\n\n",
+    sep = ""
+  )
+})
+```
+
+# 13. Exports
+
+```{r exports}
+write_csv(all_benchmarks, file.path(OUTPUT_DIR, "benchmark_results.csv"))
+# Written for the thesis: Table 11, the per-store statistical benchmark rows
+# (Auto-ARIMA, ETS, Theta) and the two naive baselines.
+dir.create("thesis_tables", showWarnings = FALSE)
+write_csv(all_benchmarks, "thesis_tables/statistical_benchmarks.csv")
+write_csv(stage_results, file.path(OUTPUT_DIR, "incremental_ml_results.csv"))
+write_csv(transition_table, file.path(OUTPUT_DIR, "benchmark_transition_table.csv"))
+write_csv(incremental_results, file.path(OUTPUT_DIR, "incremental_information_gains.csv"))
+write_csv(importance_groups, file.path(OUTPUT_DIR, "final_information_group_importance.csv"))
+
+if (SAVE_PREDICTIONS) {
+  write_csv(
+    statistical_obj$predictions,
+    file.path(OUTPUT_DIR, "statistical_predictions.csv")
+  )
+  write_csv(
+    stage_predictions,
+    file.path(OUTPUT_DIR, "ml_stage_predictions.csv")
+  )
+}
+
+ggsave(
+  file.path(OUTPUT_DIR, "01_rmse_path.pdf"),
+  p_rmse_path, width = 9, height = 5
+)
+ggsave(
+  file.path(OUTPUT_DIR, "01_rmse_path.png"),
+  p_rmse_path, width = 9, height = 5, dpi = 180
+)
+ggsave(
+  file.path(OUTPUT_DIR, "02_benchmark_improvement.pdf"),
+  p_improvement, width = 9, height = 5
+)
+ggsave(
+  file.path(OUTPUT_DIR, "02_benchmark_improvement.png"),
+  p_improvement, width = 9, height = 5, dpi = 180
+)
+ggsave(
+  file.path(OUTPUT_DIR, "03_incremental_information_gain.pdf"),
+  p_incremental, width = 9, height = 5
+)
+ggsave(
+  file.path(OUTPUT_DIR, "03_incremental_information_gain.png"),
+  p_incremental, width = 9, height = 5, dpi = 180
+)
+ggsave(
+  file.path(OUTPUT_DIR, "04_final_information_importance.pdf"),
+  p_importance_groups, width = 8, height = 4.5
+)
+ggsave(
+  file.path(OUTPUT_DIR, "04_final_information_importance.png"),
+  p_importance_groups, width = 8, height = 4.5, dpi = 180
+)
+
+cat("Outputs written to:", normalizePath(OUTPUT_DIR), "\n")
+```
+
+# 14. Session information
+
+```{r session-info}
+sessionInfo()
+```

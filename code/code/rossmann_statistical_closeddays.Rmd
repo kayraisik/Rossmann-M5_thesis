@@ -1,0 +1,150 @@
+---
+title: "Statistical Benchmarks: closed-day handling (zero-fill vs interpolation)"
+author: "Kayra Isik"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_statistical_closeddays.Rmd
+  PURPOSE   Robustness check on closed-day handling for the statistical benchmarks.
+            Re-runs Auto-ARIMA, ETS and Theta on the same stores and the same
+            open-day test set under two treatments: closed days as zeros (the
+            thesis approach) and closed days interpolated with forecast::na.interp.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   none; results are read from the rendered HTML
+  THESIS    No table of its own. It bounds the effect of the zero-fill choice on the
+            statistical benchmark rows of Table 11.
+  NOTE      Only ARIMA, ETS and Theta are affected. The tree and regression models use
+            the open-day feature matrix and never see a zero-filled day.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      cache = FALSE, fig.align = "center")
+```
+
+# Purpose
+
+Auto-ARIMA, ETS, and Theta need a regular daily series, so the thesis inserts a
+**zero** on closed days. But a closed store is not a zero-sales day. The zeros
+drag a store's estimated level and weekly seasonal down, which can bias the
+open-day forecasts low and inflate these models' RMSE, putting them at an unfair
+disadvantage.
+
+This file re-runs the three statistical benchmarks on the **same stores and the
+same open-day test set**, under two closed-day treatments:
+
+- **zero**: closed days entered as zero sales (the current thesis approach);
+- **interp**: closed days treated as missing and filled with
+  `forecast::na.interp`, which preserves the level and weekly pattern.
+
+If `interp` lowers the RMSE meaningfully, the statistical benchmarks are stronger
+than the thesis reports, and the better numbers should replace the current ones.
+Only ARIMA/ETS/Theta are affected; the regression and tree models use the
+open-day feature matrix and never see a zero-filled day.
+
+# 1. Packages and configuration
+
+```{r packages}
+library(tidyverse); library(lubridate); library(forecast)
+TRAIN_CSV <- "train.csv"; STORE_CSV <- "store.csv"
+TEST_DAYS <- 42; SEED <- 42; FREQ <- 7
+# Quick check on a sample first; set SAMPLE_N <- NULL to run all 1115 (slow).
+SAMPLE_N <- 400
+set.seed(SEED)
+```
+
+# 2. Data
+
+```{r load}
+train_raw <- read_csv(TRAIN_CSV, show_col_types = FALSE) %>%
+  mutate(Date = as.Date(Date)) %>% arrange(Store, Date)
+stores <- sort(unique(train_raw$Store))
+if (!is.null(SAMPLE_N)) stores <- sort(sample(stores, SAMPLE_N))
+cat("Stores evaluated:", length(stores), "\n")
+```
+
+# 3. Per-store evaluation under both treatments
+
+```{r eval}
+# For one store: build the daily series, fit each model under each treatment,
+# forecast the 42-day horizon, and return squared errors on the OPEN test days.
+eval_store <- function(s) {
+  d <- train_raw %>% filter(Store == s) %>% arrange(Date)
+  n <- nrow(d); if (n <= TEST_DAYS + 2 * FREQ) return(NULL)
+  cut <- n - TEST_DAYS
+  tr <- 1:cut; te <- (cut + 1):n
+
+  # open test rows are the only ones evaluated (Open == 1 and Sales > 0)
+  open_te <- te[d$Open[te] == 1 & d$Sales[te] > 0]
+  if (length(open_te) == 0) return(NULL)
+  actual  <- d$Sales[open_te]
+  pos_h   <- open_te - cut                       # position within the 42-day horizon
+
+  sales0  <- d$Sales[tr]                          # zeros on closed days (raw)
+  salesNA <- ifelse(d$Open[tr] == 0 | d$Sales[tr] == 0, NA, d$Sales[tr])
+
+  series <- list(
+    zero   = ts(sales0, frequency = FREQ),
+    interp = na.interp(ts(salesNA, frequency = FREQ))
+  )
+
+  out <- list()
+  for (h in names(series)) {
+    y <- series[[h]]
+    fcs <- list(
+      ARIMA = tryCatch(as.numeric(forecast(auto.arima(y, stepwise = TRUE,
+                         approximation = TRUE), h = TEST_DAYS)$mean),
+                       error = function(e) rep(mean(y), TEST_DAYS)),
+      ETS   = tryCatch(as.numeric(forecast(ets(y), h = TEST_DAYS)$mean),
+                       error = function(e) rep(mean(y), TEST_DAYS)),
+      Theta = tryCatch(as.numeric(thetaf(y, h = TEST_DAYS)$mean),
+                       error = function(e) rep(mean(y), TEST_DAYS))
+    )
+    for (m in names(fcs)) {
+      pred <- fcs[[m]][pos_h]
+      out[[paste(h, m)]] <- (actual - pred)^2
+    }
+  }
+  imap_dfr(out, ~ tibble(key = .y, sq = .x))
+}
+
+res <- map_dfr(stores, eval_store)
+```
+
+# 4. Pooled RMSE: zero vs interp
+
+```{r summary}
+summ <- res %>%
+  separate(key, into = c("Treatment", "Model"), sep = " ") %>%
+  group_by(Model, Treatment) %>%
+  summarise(RMSE = sqrt(mean(sq)), obs = n(), .groups = "drop") %>%
+  select(-obs) %>%
+  pivot_wider(names_from = Treatment, values_from = RMSE) %>%
+  mutate(zero = round(zero), interp = round(interp),
+         improvement_pct = round((zero - interp) / zero * 100, 1))
+summ
+```
+
+# 5. Read-off
+
+```{r verdict}
+cat("If `interp` is clearly below `zero`, the zero-fill was inflating the\n",
+    "statistical-model RMSE; rerun with SAMPLE_N <- NULL for the full-sample\n",
+    "numbers and replace Auto-ARIMA/ETS/Theta in the Stage 1 table.\n")
+```
+
+```{r session}
+sessionInfo()
+```

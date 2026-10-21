@@ -1,0 +1,121 @@
+---
+title: "Rossmann — estimating mu, delta and u"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    theme: flatly
+    code_folding: show
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_decomposition.Rmd
+  PURPOSE   Puts numbers on the three parts of Equation (1),
+            y_{s,t} = mu_s + delta_{s,t} + u_{s,t}, on the Stage 1 holdout.
+            mu_s      : the store's training mean.
+            delta_s,t : the forecast minus mu_s, for a forecast that uses a given
+                        information set F (weekly means, the full no-lag features,
+                        or the features plus recent sales).
+            u_s,t     : actual sales minus that forecast.
+            delta depends on F by definition, so it is reported for each F.
+            The best forecast gives the closest available estimate: its delta
+            is a lower bound on the true predictable part and its u an upper
+            bound on the true residual.
+  INPUTS    train.csv, store.csv, rossmann_stages2_4.Rmd (pipeline chunk only)
+  OUTPUTS   thesis_tables/decomposition.csv          (one row per information set)
+            thesis_tables/decomposition_store1.csv   (daily values for Store 1)
+  RUNTIME   Two LightGBM fits (about 10 to 30 minutes). LightGBM is seeded, so
+            the results are reproducible. No XGBoost is used.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Pipeline
+
+```{r pipeline}
+# The code of the pipeline chunk of rossmann_stages2_4.Rmd, so data, features,
+# split and model settings are exactly those of Stages 1 to 4.
+lines <- readLines("rossmann_stages2_4.Rmd")
+start <- grep("^```\\{r pipeline", lines)[1]
+end   <- start + which(grepl("^```\\s*$", lines[(start + 1):length(lines)]))[1]
+eval(parse(text = lines[(start + 1):(end - 1)]), envir = globalenv())
+```
+
+# Forecasts under three information sets
+
+```{r fits}
+sp <- split_data(df, FEAT_S1)                       # Stage 1 holdout, no lags
+te <- sp$test %>% select(Store, Date, Sales)
+
+# mu: the store's training mean (the Store-mean baseline)
+mu <- sp$train %>% group_by(Store) %>% summarise(mu = mean(Sales), .groups = "drop")
+te <- te %>% left_join(mu, by = "Store")
+
+# F1 weekly: store x day-of-week means (the Store-DOW baseline)
+dow <- sp$train %>% group_by(Store, DayOfWeek) %>% summarise(f = mean(Sales), .groups = "drop")
+te$f_weekly <- sp$test %>% left_join(dow, by = c("Store", "DayOfWeek")) %>% pull(f)
+te$f_weekly <- coalesce(te$f_weekly, te$mu)
+
+# F2 full no-lag features: LightGBM as in Stage 1
+fit2 <- run_lightgbm(sp, return_model = TRUE)
+te$f_features <- predict(fit2$model, sp$X_test)
+
+# F3 features plus recent sales (lags, one-step updating): LightGBM as in Stage 3
+df_lags <- df %>% group_by(Store) %>% arrange(Date) %>% group_modify(~ add_lag_features(.x)) %>%
+  ungroup() %>% filter(!is.na(lag28), !is.na(roll28_mean))
+sp3  <- split_data(df_lags, FEAT_S3)
+fit3 <- run_lightgbm(sp3, return_model = TRUE)
+te <- te %>% left_join(sp3$test %>% select(Store, Date) %>% mutate(f_lags = predict(fit3$model, sp3$X_test)),
+                       by = c("Store", "Date"))
+
+c(rows = nrow(te), missing_lag_forecasts = sum(is.na(te$f_lags)),
+  rmse_features = sqrt(mean((te$Sales - te$f_features)^2)),
+  rmse_lags     = sqrt(mean((te$Sales - te$f_lags)^2, na.rm = TRUE)))
+```
+
+# Decomposition
+
+For every test store-day, `y - mu = delta + u` holds exactly, so the mean squared
+departure from the store level splits into a delta part, a u part and a cross
+term. `share_delta` is the share of that departure the information set explains.
+
+```{r decomp}
+te <- te %>% filter(!is.na(f_lags))                 # same rows for all three sets
+dev <- te$Sales - te$mu
+msq_dev <- mean(dev^2)
+one <- function(label, f) {
+  delta <- f - te$mu; u <- te$Sales - f
+  tibble(Information_set = label,
+         mu_sd_across_stores = sd(mu$mu),
+         mu_mean = mean(te$mu),
+         departure_rms = sqrt(msq_dev),
+         delta_rms = sqrt(mean(delta^2)),
+         u_rms     = sqrt(mean(u^2)),
+         cross_term = 2 * mean(delta * u),
+         share_delta = 1 - mean(u^2) / msq_dev)
+}
+decomp <- bind_rows(one("Weekly (Store-DOW)", te$f_weekly),
+                    one("Calendar, store, promotion (LightGBM)", te$f_features),
+                    one("Plus recent sales (LightGBM, lags)", te$f_lags)) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+decomp
+
+dir.create("thesis_tables", showWarnings = FALSE)
+write_csv(decomp, "thesis_tables/decomposition.csv")
+```
+
+# One store, day by day
+
+```{r store1}
+s1 <- te %>% filter(Store == 1) %>% arrange(Date) %>%
+  transmute(Date, Sales, mu, delta = f_lags - mu, u = Sales - f_lags)
+s1
+write_csv(s1, "thesis_tables/decomposition_store1.csv")
+```
+
+```{r session}
+sessionInfo()
+```

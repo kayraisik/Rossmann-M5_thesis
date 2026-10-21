@@ -1,0 +1,212 @@
+---
+title: "Rossmann Stage 6 — Additional Analyses (extensions)"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_stage6.Rmd
+  PURPOSE   Stage 6. Internal-validity analyses E1 to E7: fixed-origin recursive lag
+            forecasts, Diebold-Mariano tests, number-of-stores replication SD,
+            per-store framework validation, hyperparameter grid, fixed-composition
+            scale, and global versus local LightGBM.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   none; results are read from the rendered HTML
+  THESIS    Section 5.3.8 and Table 19.
+  NOTE      This file supersedes rossmann_thesis_extensions.Rmd, which runs the same
+            analyses in an earlier form. Where the tab_e1 to tab_e7 CSVs disagree
+            with this file, the thesis follows this file.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+Self-contained. Internal-validity analyses E1-E7. Needs `train.csv`,
+`store.csv`, and the `forecast` package (for the Diebold-Mariano test). Toggle
+slow parts with the switches below.
+
+# Pipeline + switches
+
+```{r pipeline}
+library(tidyverse); library(lubridate); library(zoo); library(xgboost); library(lightgbm); library(forecast)
+TRAIN_CSV<-"train.csv"; STORE_CSV<-"store.csv"
+N_THREADS<-max(1,parallel::detectCores()-1); TEST_DAYS<-42; VAL_FRAC<-0.15; SEED<-42; N_REPS<-5; set.seed(SEED)
+
+RUN_E1<-TRUE; RUN_E2<-TRUE; RUN_E3<-TRUE; RUN_E4<-TRUE; RUN_E5<-TRUE; RUN_E6<-TRUE; RUN_E7<-TRUE
+SEEDS<-SEED+1:N_REPS; N_LOCAL_STORES<-200
+
+train_raw<-read_csv(TRAIN_CSV,show_col_types=FALSE) %>% mutate(Date=as.Date(Date))
+store_raw<-read_csv(STORE_CSV,show_col_types=FALSE)
+df<-train_raw %>% filter(Open==1,Sales>0) %>% left_join(store_raw,by="Store") %>%
+  mutate(Year=year(Date),Month=month(Date),Week=isoweek(Date),DayOfMonth=mday(Date),Quarter=quarter(Date),
+         IsWeekend=as.integer(DayOfWeek %in% c(6,7)),
+         StateHoliday=case_when(StateHoliday=="a"~1L,StateHoliday=="b"~2L,StateHoliday=="c"~3L,TRUE~0L),
+         CompetitionOpenMonths=ifelse(!is.na(CompetitionOpenSinceYear)&!is.na(CompetitionOpenSinceMonth),
+           (Year-CompetitionOpenSinceYear)*12+(Month-CompetitionOpenSinceMonth),NA_real_),
+         CompetitionOpenMonths=pmax(CompetitionOpenMonths,0,na.rm=TRUE),
+         StoreType=as.integer(factor(StoreType,levels=c("a","b","c","d"))),
+         Assortment=as.integer(factor(Assortment,levels=c("a","b","c")))) %>%
+  select(Store,Date,Sales,DayOfWeek,Promo,StateHoliday,SchoolHoliday,StoreType,Assortment,
+         CompetitionDistance,Promo2,Year,Month,Week,DayOfMonth,Quarter,IsWeekend,CompetitionOpenMonths)
+med<-median(df$CompetitionDistance,na.rm=TRUE)
+df<-df %>% mutate(CompetitionDistance=replace_na(CompetitionDistance,med),
+                  CompetitionOpenMonths=replace_na(CompetitionOpenMonths,0)) %>% arrange(Date,Store)
+
+FEAT_S1<-c("Store","DayOfWeek","Promo","StateHoliday","SchoolHoliday","StoreType","Assortment",
+  "CompetitionDistance","Promo2","Year","Month","Week","DayOfMonth","Quarter","IsWeekend","CompetitionOpenMonths")
+LAG_COLS<-c("lag1","lag7","lag14","lag28"); ROLL_COLS<-c("roll7_mean","roll28_mean"); FEAT_S3<-c(FEAT_S1,LAG_COLS,ROLL_COLS)
+add_lag_features<-function(s){ s<-s %>% arrange(Date); s$lag1<-lag(s$Sales,1);s$lag7<-lag(s$Sales,7);s$lag14<-lag(s$Sales,14);s$lag28<-lag(s$Sales,28)
+  s$roll7_mean<-lag(rollmeanr(s$Sales,7,fill=NA,na.rm=TRUE),1); s$roll28_mean<-lag(rollmeanr(s$Sales,28,fill=NA,na.rm=TRUE),1); s }
+
+split_data<-function(data,fc,td=TEST_DAYS){ data<-data %>% arrange(Date,Store); d<-sort(unique(data$Date)); cut<-d[length(d)-td]
+  tr<-data %>% filter(Date<=cut); te<-data %>% filter(Date>cut)
+  list(X_train=as.matrix(tr[,fc]),y_train=tr$Sales,X_test=as.matrix(te[,fc]),y_test=te$Sales,train=tr,test=te) }
+eval_metrics<-function(a,p){ v<-!is.na(a)&a!=0; tibble(RMSE=sqrt(mean((a-p)^2)),MAE=mean(abs(a-p)),MAPE=mean(abs((a[v]-p[v])/a[v]))*100) }
+delta_rel<-function(ref,x)(ref-x)/ref*100
+run_store_mean<-function(sp,return_pred=FALSE){ sm<-sp$train %>% group_by(Store) %>% summarise(m=mean(Sales),.groups="drop")
+  p<-sp$test %>% left_join(sm,by="Store") %>% mutate(m=replace_na(m,mean(sp$train$Sales))) %>% pull(m); if(return_pred) return(p); eval_metrics(sp$y_test,p) }
+run_store_dow<-function(sp,return_pred=FALSE){ dm<-sp$train %>% group_by(Store,DayOfWeek) %>% summarise(md=mean(Sales),.groups="drop")
+  sm<-sp$train %>% group_by(Store) %>% summarise(ms=mean(Sales),.groups="drop"); gm<-mean(sp$train$Sales)
+  p<-sp$test %>% left_join(dm,by=c("Store","DayOfWeek")) %>% left_join(sm,by="Store") %>% mutate(p=coalesce(md,ms,gm)) %>% pull(p); if(return_pred) return(p); eval_metrics(sp$y_test,p) }
+val_idx<-function(tr,vf=VAL_FRAC){ d<-sort(unique(tr$Date)); which(tr$Date>d[floor(length(d)*(1-vf))]) }
+run_xgboost<-function(sp,max_depth=6,max_rounds=1500,es=50,return_model=FALSE){ X<-sp$X_train;y<-sp$y_train; vi<-val_idx(sp$train);ti<-setdiff(seq_along(y),vi)
+  pr<-list(objective="reg:squarederror",eta=0.10,max_depth=max_depth,subsample=0.8,colsample_bytree=0.8,nthread=N_THREADS,verbosity=0)
+  e<-xgb.train(pr,xgb.DMatrix(X[ti,],label=y[ti]),nrounds=max_rounds,watchlist=list(val=xgb.DMatrix(X[vi,],label=y[vi])),early_stopping_rounds=es,verbose=0)
+  f<-xgb.train(pr,xgb.DMatrix(X,label=y),nrounds=e$best_iteration,verbose=0); p<-predict(f,xgb.DMatrix(sp$X_test))
+  if(return_model) return(list(metrics=eval_metrics(sp$y_test,p),model=f,pred=p,feat=colnames(X))); eval_metrics(sp$y_test,p) }
+run_lightgbm<-function(sp,num_leaves=63,max_rounds=2000,es=50,return_model=FALSE){ X<-sp$X_train;y<-sp$y_train; vi<-val_idx(sp$train);ti<-setdiff(seq_along(y),vi)
+  pr<-list(objective="regression",metric="rmse",num_leaves=num_leaves,learning_rate=0.05,bagging_fraction=0.8,bagging_freq=1,feature_fraction=0.8,num_threads=N_THREADS,seed=SEED,verbosity=-1)
+  e<-lgb.train(pr,lgb.Dataset(X[ti,],label=y[ti]),nrounds=max_rounds,valids=list(val=lgb.Dataset(X[vi,],label=y[vi])),early_stopping_rounds=es,verbose=-1)
+  f<-lgb.train(pr,lgb.Dataset(X,label=y),nrounds=e$best_iter,verbose=-1); p<-predict(f,sp$X_test)
+  if(return_model) return(list(metrics=eval_metrics(sp$y_test,p),model=f,pred=p,feat=colnames(X))); eval_metrics(sp$y_test,p) }
+
+# main holdout predictions (reused by E1/E2/E4)
+sp1<-split_data(df,FEAT_S1); xgb1<-run_xgboost(sp1,return_model=TRUE); lgb1<-run_lightgbm(sp1,return_model=TRUE)
+holdout<-sp1$test %>% mutate(pred_dow=run_store_dow(sp1,return_pred=TRUE), pred_xgb=xgb1$pred, pred_lgbm=lgb1$pred)
+cutoff<-sort(unique(df$Date))[length(unique(df$Date))-TEST_DAYS]
+train_df<-df %>% filter(Date<=cutoff); test_df<-df %>% filter(Date>cutoff) %>% arrange(Date,Store)
+tibble(Model=c("Store-DOW","XGBoost","LightGBM"),
+       RMSE=c(sqrt(mean((holdout$Sales-holdout$pred_dow)^2)), xgb1$metrics$RMSE, lgb1$metrics$RMSE))
+```
+
+# E1 — Fixed-origin recursive 42-day forecast
+
+```{r e1, eval=RUN_E1, cache=TRUE}
+df_lags<-df %>% group_by(Store) %>% arrange(Date) %>% group_modify(~ add_lag_features(.x)) %>% ungroup() %>%
+  filter(!is.na(lag28), !is.na(roll28_mean))
+spL<-split_data(df_lags,FEAT_S3); mL<-run_lightgbm(spL,return_model=TRUE)$model; mX<-run_xgboost(spL,return_model=TRUE)$model
+test_dates<-sort(unique(test_df$Date)); history<-split(train_df$Sales,train_df$Store)
+recursive_forecast<-function(model,is_lgb){ h<-history; preds<-numeric(nrow(test_df)); rows<-split(seq_len(nrow(test_df)),test_df$Date)
+  for(d in as.character(test_dates)){ idx<-rows[[d]]; day<-test_df[idx,]; sid<-as.character(day$Store)
+    lagf<-t(vapply(sid,function(s){ hh<-h[[s]]; n<-length(hh)
+      c(hh[n],hh[max(1,n-6)],hh[max(1,n-13)],hh[max(1,n-27)],mean(hh[max(1,n-6):n]),mean(hh[max(1,n-27):n])) },numeric(6)))
+    X<-cbind(as.matrix(day[,FEAT_S1]),lagf); colnames(X)<-FEAT_S3
+    p<-if(is_lgb) predict(model,X) else predict(model,xgb.DMatrix(X)); preds[idx]<-p
+    for(j in seq_along(sid)) h[[sid[j]]]<-c(h[[sid[j]]],p[j]) }
+  preds }
+e1<-tibble(Model=c("LightGBM","XGBoost"),
+  `Stage1 fixed-origin`=c(lgb1$metrics$RMSE, xgb1$metrics$RMSE),
+  `Stage3b recursive`=c(sqrt(mean((test_df$Sales-recursive_forecast(mL,TRUE))^2)),
+                        sqrt(mean((test_df$Sales-recursive_forecast(mX,FALSE))^2)))); e1
+```
+
+# E2 — Diebold-Mariano tests
+
+```{r e2, eval=RUN_E2}
+daily_sq<-function(pred) holdout %>% mutate(sq=(Sales-pred)^2) %>% group_by(Date) %>% summarise(l=mean(sq),.groups="drop") %>% arrange(Date) %>% pull(l)
+dm_pair<-function(l1,l2,lab){ dm<-dm.test(sqrt(l1),sqrt(l2),alternative="two.sided",h=1,power=2)
+  tibble(Comparison=lab,DM=unname(dm$statistic),p=dm$p.value) }
+ll<-daily_sq(holdout$pred_lgbm); lx<-daily_sq(holdout$pred_xgb); ld<-daily_sq(holdout$pred_dow)
+bind_rows(dm_pair(ll,lx,"LightGBM vs XGBoost"),dm_pair(ll,ld,"LightGBM vs Store-DOW"),dm_pair(lx,ld,"XGBoost vs Store-DOW"))
+```
+
+# E3 — Number-of-stores replication SD
+
+```{r e3, eval=RUN_E3, cache=TRUE}
+gain_once<-function(stores,seed){ set.seed(seed); sub<-df %>% filter(Store %in% stores); sp<-split_data(sub,FEAT_S1); rn<-run_store_mean(sp)$RMSE
+  tibble(gain_xgb=delta_rel(rn,run_xgboost(sp)$RMSE), gain_lgbm=delta_rel(rn,run_lightgbm(sp)$RMSE)) }
+
+# scale_grid: gain over store-mean at each N, averaged over random draws, with the
+# standard error across draws (se = sd/sqrt(reps)). When N reaches the whole pool
+# the sample is the population, so it is run once and the SE is undefined (NA).
+scale_grid<-function(pool, ns){
+  map_dfr(ns, function(n){
+    seeds_use<-if (n>=length(pool)) SEEDS[1] else SEEDS
+    map_dfr(seeds_use, function(s){ set.seed(s); gain_once(sample(pool, min(n,length(pool))), s) %>% mutate(N=n) })
+  }) %>% group_by(N) %>%
+    summarise(across(starts_with("gain"),
+                     list(mean=~mean(.x),
+                          se=~if (length(.x)>1) sd(.x)/sqrt(length(.x)) else NA_real_),
+                     .names="{.col}_{.fn}"),
+              reps=n(), .groups="drop")
+}
+all_stores<-unique(df$Store)
+e3<-scale_grid(all_stores, c(50,200,500,length(all_stores))); e3   # mixed composition, up to all 1115
+```
+
+# E4 — Framework validation (per-store)
+
+```{r e4, eval=RUN_E4, fig.width=7, fig.height=4.2}
+var_delta<-train_df %>% group_by(Store) %>% mutate(cell=ave(Sales,DayOfWeek,Promo)) %>%
+  summarise(var_expl=var(cell),.groups="drop")
+store_gain<-holdout %>% group_by(Store) %>% summarise(mse_dow=mean((Sales-pred_dow)^2), mse_lgbm=mean((Sales-pred_lgbm)^2),.groups="drop")
+e4<-inner_join(var_delta,store_gain,by="Store") %>% mutate(mse_gain=mse_dow-mse_lgbm)
+ct<-cor.test(e4$var_expl,e4$mse_gain)
+cat(sprintf("cor(Var(delta) proxy, MSE gain) = %.3f  (p = %s, n = %d)\n", ct$estimate, format.pval(ct$p.value), nrow(e4)))
+ggplot(e4,aes(var_expl/1e6,mse_gain/1e6))+geom_point(alpha=0.3,size=1)+geom_smooth(method="lm",se=TRUE,linewidth=0.7)+
+  labs(x="Predictable within-store variance (M, train)",y="MSE reduction vs Store-DOW (M, test)",
+       title="Framework check: predictable variation vs realised gain")+theme_minimal(base_size=11)
+```
+
+# E5 — Hyperparameter grid
+
+```{r e5, eval=RUN_E5, cache=TRUE}
+e5_grid <- bind_rows(
+  map_dfr(c(6,8,10), ~tibble(Model="XGBoost",Setting=paste0("max_depth = ",.x),RMSE=run_xgboost(sp1,max_depth=.x)$RMSE)),
+  map_dfr(c(31,63,127), ~tibble(Model="LightGBM",Setting=paste0("num_leaves = ",.x),RMSE=run_lightgbm(sp1,num_leaves=.x)$RMSE))
+) %>% arrange(RMSE) %>% mutate(RMSE=round(RMSE))
+e5_grid
+# Written for the thesis: Table 19 (hyperparameter grid on the primary
+# holdout). Built into the .Rnw by the grid-table chunk. Do not edit the CSV.
+dir.create("thesis_tables", showWarnings = FALSE)
+write_csv(e5_grid, "thesis_tables/hyperparameter_grid.csv")
+```
+
+# E6 — Fixed-composition scale (Type A only)
+
+```{r e6, eval=RUN_E6, cache=TRUE}
+stores_a<-df %>% filter(StoreType==1) %>% distinct(Store) %>% pull(Store)
+cat("Type A stores available (fixed-composition cap):", length(stores_a), "\n")
+# extend the fixed-composition scale up to the full Type A set; reuses scale_grid + gain_once from E3
+e6<-scale_grid(stores_a, c(50,200,400,length(stores_a))); e6
+```
+
+# E7 — Global vs local LightGBM
+
+```{r e7, eval=RUN_E7, cache=TRUE}
+set.seed(SEED); samp<-sample(unique(df$Store),N_LOCAL_STORES); glob<-holdout %>% filter(Store %in% samp)
+feats_local<-setdiff(FEAT_S1,c("Store","StoreType","Assortment","CompetitionDistance","Promo2"))
+local_one<-function(s){ tr<-train_df %>% filter(Store==s); te<-test_df %>% filter(Store==s); if(nrow(te)==0) return(NULL)
+  m<-lgb.train(params=list(objective="regression",metric="rmse",num_leaves=15,learning_rate=0.05,min_data_in_leaf=20,num_threads=1,seed=SEED,verbosity=-1),
+               data=lgb.Dataset(as.matrix(tr[,feats_local]),label=tr$Sales),nrounds=300,verbose=-1)
+  tibble(Sales=te$Sales,pred=predict(m,as.matrix(te[,feats_local]))) }
+loc<-map_dfr(samp,local_one)
+tibble(Model=c("Global LightGBM","Local LightGBM (per store)"),
+       RMSE=c(sqrt(mean((glob$Sales-glob$pred_lgbm)^2)), sqrt(mean((loc$Sales-loc$pred)^2))), Stores=N_LOCAL_STORES)
+```
+
+```{r session}
+sessionInfo()
+```

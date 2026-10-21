@@ -1,0 +1,317 @@
+---
+title: "Rossmann — ARIMAX vs Pooled Trees under Shorter Training Histories"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_arimax_history.Rmd
+  PURPOSE   Follow-up to rossmann_arimax.Rmd. Same 50 stores, same two origins,
+            same covariates; only the length of the training history changes
+            (3, 6, 12 months). Tests whether the per-store ARIMAX loses ground
+            to the pooled tree models as each store's own history shrinks.
+  INPUTS    train.csv, store.csv (same folder)
+            thesis_tables/arimax_comparison.csv (full-history rows, written by
+            rossmann_arimax.Rmd; knit that file first)
+  OUTPUTS   thesis_tables/arimax_history.csv      RMSE/MAE by origin, window, model
+            thesis_tables/arimax_history_ci.csv   LightGBM minus ARIMAX intervals
+            rossmann_outputs/arimax_history_predictions.csv
+            rossmann_outputs/fig_arimax_history.pdf
+  THESIS    Table tab:arimax_history and the paragraphs "Shorter training
+            histories" and "Why the tree models remain the main models".
+  NOTE      The model chunk is cached. Shorter series fit faster than the full
+            history, so the first knit should take less than rossmann_arimax.Rmd.
+
+  Self-contained apart from reading the full-history tables.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Purpose and hypothesis (stated before running)
+
+ARIMAX is fitted separately for every store, so each model learns only from
+that store's own history. LightGBM and XGBoost are pooled: one model learns
+from all 50 stores at once. The global-versus-local argument
+(Montero-Manso and Hyndman, 2021) implies that pooling matters most when each
+series is short.
+
+**Hypothesis.** As the training history shrinks from the full sample to
+12, 6 and 3 months, ARIMAX's RMSE rises faster than LightGBM's, so the
+LightGBM-minus-ARIMAX difference moves in favour of LightGBM.
+
+**What would contradict it.** ARIMAX keeping pace with, or improving
+relative to, LightGBM as the window shrinks. The result is reported either way.
+
+**Design rules fixed in advance.**
+
+* Same 50 stores (same eligibility rule and seed as `rossmann_arimax.Rmd`),
+  same origins (8 May and 19 June 2015), same 42-day horizon, same test rows.
+* Every model sees the same training window. Only the window length changes.
+* The annual sine/cosine pair cannot be estimated from less than one year of
+  data, so for the 3- and 6-month windows it is removed from **all** models.
+  The 12-month window keeps it, as does the full-history run.
+* ARIMA search, tree settings and early stopping are unchanged.
+
+# 1. Packages and data
+
+```{r packages}
+library(data.table)
+library(forecast)
+library(lightgbm)
+library(xgboost)
+
+data_dirs <- c(".", "..", "Data/rossmann-store-sales", "../Data/rossmann-store-sales")
+DATA_DIR  <- data_dirs[file.exists(file.path(data_dirs, "train.csv"))][1]
+if (is.na(DATA_DIR)) stop("train.csv not found in: ", paste(data_dirs, collapse = ", "))
+if (!file.exists("thesis_tables/arimax_comparison.csv"))
+  stop("Knit rossmann_arimax.Rmd first: thesis_tables/arimax_comparison.csv is missing.")
+
+SEED      <- 230923
+BOOT_SEED <- 230925
+H         <- 42
+N_CORES   <- max(1, min(4, parallel::detectCores() - 1))
+ORIGINS   <- as.Date(c("2015-05-08", "2015-06-19"))
+WINDOWS   <- c("3 months" = 91L, "6 months" = 182L, "12 months" = 364L)
+
+dir.create("thesis_tables",    showWarnings = FALSE)
+dir.create("rossmann_outputs", showWarnings = FALSE)
+
+raw <- fread(file.path(DATA_DIR, "train.csv"))
+raw[, Date := as.Date(Date)]
+stores <- fread(file.path(DATA_DIR, "store.csv"))
+```
+
+# 2. Same 50 stores as the main ARIMAX check
+
+```{r sample}
+set.seed(SEED)
+eligible <- raw[Date <= ORIGINS[1], .(n = .N, first = min(Date)), by = Store]
+full_len <- as.integer(ORIGINS[1] - as.Date("2013-01-01")) + 1
+eligible <- eligible[n == full_len & first == as.Date("2013-01-01")]
+pool <- merge(eligible, stores[, .(Store, StoreType)], by = "Store")
+allocation <- c(a = 27L, b = 1L, c = 7L, d = 15L)
+ids <- unlist(lapply(names(allocation), function(k)
+  sample(sort(pool[StoreType == k, Store]), allocation[[k]])))
+
+# Must be the same stores as in rossmann_arimax.Rmd.
+if (file.exists("rossmann_outputs/arimax_sample.csv")) {
+  prev <- fread("rossmann_outputs/arimax_sample.csv")$Store
+  stopifnot(setequal(prev, ids))
+  cat("Store sample matches rossmann_arimax.Rmd\n")
+}
+```
+
+# 3. Covariates
+
+```{r covariates}
+raw <- raw[Store %in% ids][order(Store, Date)]
+raw[, DOW := factor(as.integer(format(Date, "%u")), levels = 1:7)]
+raw[, day := as.numeric(Date - as.Date("2013-01-01")) / 365.25]
+raw[, annual_sin := sin(2 * pi * day)]
+raw[, annual_cos := cos(2 * pi * day)]
+raw[, holiday := as.integer(StateHoliday != "0")]
+
+X_full <- model.matrix(~ DOW * Promo + SchoolHoliday + holiday + Open +
+                         annual_sin + annual_cos + day, raw)[, -1, drop = FALSE]
+colnames(X_full) <- make.names(colnames(X_full))
+# Design rule: no annual terms when the window is shorter than a year.
+X_for <- function(days) {
+  if (days < 364) X_full[, !colnames(X_full) %in% c("annual_sin", "annual_cos"), drop = FALSE]
+  else X_full
+}
+storex <- model.matrix(~ factor(Store) - 1, raw)
+```
+
+# 4. Models
+
+```{r fns}
+predict_store <- function(s, origin, days, X) {
+  ix <- which(raw$Store == s & raw$Date <= origin & raw$Date > origin - days)
+  it <- which(raw$Store == s & raw$Date > origin & raw$Date <= origin + H)
+  xx <- X[ix, , drop = FALSE]
+  qq <- qr(cbind(Intercept = 1, xx))
+  keep <- sort(qq$pivot[seq_len(qq$rank)]); keep <- keep[keep > 1] - 1L
+  fit <- auto.arima(ts(raw$Sales[ix], frequency = 7), xreg = xx[, keep, drop = FALSE],
+                    seasonal = TRUE, stepwise = TRUE, approximation = TRUE,
+                    max.p = 3, max.q = 3, max.P = 1, max.Q = 1, max.order = 5)
+  data.table(Store = s, Date = raw$Date[it], Sales = raw$Sales[it], Open = raw$Open[it],
+             Prediction = as.numeric(forecast(fit, xreg = X[it, keep, drop = FALSE],
+                                              h = length(it))$mean))
+}
+xgb_fit_valid <- function(params, dtrain, dvalid) {
+  a <- list(params = params, data = dtrain, nrounds = 1200,
+            early_stopping_rounds = 50, verbose = 0)
+  if ("evals" %in% names(formals(xgb.train))) a$evals <- list(valid = dvalid)
+  else a$watchlist <- list(valid = dvalid)
+  do.call(xgb.train, a)
+}
+xgb_best <- function(fit) {
+  b <- tryCatch(as.integer(fit$best_iteration), error = function(e) integer())
+  if (!length(b) || is.na(b)) b <- as.integer(xgb.attr(fit, "best_iteration")) + 1L
+  b
+}
+```
+
+```{r fits, cache=TRUE}
+out <- list()
+for (w in names(WINDOWS)) for (k in seq_along(ORIGINS)) {
+  days <- WINDOWS[[w]]; origin <- ORIGINS[k]; X <- X_for(days)
+  t0 <- Sys.time()
+
+  # ARIMAX, one model per store. A failed store stops the knit.
+  fits <- parallel::mclapply(ids, function(s)
+    tryCatch(predict_store(s, origin, days, X),
+             error = function(e) conditionMessage(e)), mc.cores = N_CORES)
+  bad <- !vapply(fits, is.data.table, logical(1))
+  if (any(bad)) { print(fits[bad]); stop("ARIMAX failed for a store") }
+  arimax_min <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  pp <- rbindlist(fits); pp[, Model := "ARIMAX"]
+  res <- list(pp)
+
+  # Pooled trees on the same window, store indicators added.
+  ix <- which(raw$Date <= origin & raw$Date > origin - days)
+  it <- which(raw$Date > origin & raw$Date <= origin + H)
+  xx <- cbind(X, storex); trainx <- xx[ix, , drop = FALSE]; yy <- raw$Sales[ix]
+  vv <- which(raw$Date[ix] > origin - H); tt <- setdiff(seq_along(ix), vv)
+
+  lp_par <- list(objective = "regression", metric = "rmse", num_leaves = 31,
+                 learning_rate = .05, min_data_in_leaf = 20, num_threads = 4,
+                 seed = SEED, verbosity = -1, deterministic = TRUE, force_col_wise = TRUE)
+  lv <- lgb.train(lp_par, lgb.Dataset(trainx[tt, ], label = yy[tt]), nrounds = 1200,
+                  valids = list(valid = lgb.Dataset(trainx[vv, ], label = yy[vv])),
+                  early_stopping_rounds = 50, verbose = -1)
+  lfit <- lgb.train(lp_par, lgb.Dataset(trainx, label = yy), nrounds = lv$best_iter, verbose = -1)
+
+  xp_par <- list(objective = "reg:squarederror", eta = .05, max_depth = 6, nthread = 4, seed = SEED)
+  xv <- xgb_fit_valid(xp_par, xgb.DMatrix(trainx[tt, ], label = yy[tt]),
+                      xgb.DMatrix(trainx[vv, ], label = yy[vv]))
+  xfit <- xgb.train(xp_par, xgb.DMatrix(trainx, label = yy), nrounds = xgb_best(xv), verbose = 0)
+
+  base <- raw[it, .(Store, Date, Sales, Open)]
+  res[[2]] <- copy(base)[, `:=`(Prediction = predict(lfit, xx[it, , drop = FALSE]), Model = "LightGBM")]
+  res[[3]] <- copy(base)[, `:=`(Prediction = predict(xfit, xgb.DMatrix(xx[it, , drop = FALSE])), Model = "XGBoost")]
+
+  # Store-DOW baseline on the same window.
+  bm <- raw[Date <= origin & Date > origin - days & Open == 1 & Sales > 0,
+            .(Prediction = mean(Sales)), by = .(Store, DOW)]
+  sd <- copy(base)[, DOW := raw$DOW[it]]
+  sd <- merge(sd, bm, by = c("Store", "DOW"), all.x = TRUE, sort = FALSE)[, DOW := NULL]
+  res[[4]] <- sd[, Model := "Store-DOW"]
+
+  r <- rbindlist(res, use.names = TRUE)
+  r[, `:=`(Origin = origin, Window = w, ARIMAX_minutes = round(arimax_min, 1))]
+  out[[length(out) + 1]] <- r
+  cat(w, as.character(origin), "done; ARIMAX took", round(arimax_min, 1), "min\n")
+}
+allpred <- rbindlist(out, use.names = TRUE)
+```
+
+# 5. Accuracy by training window
+
+Scored on the same open, positive-sales store-days as the main check. The
+full-history rows are read from `thesis_tables/arimax_comparison.csv`.
+
+```{r accuracy}
+fwrite(allpred, "rossmann_outputs/arimax_history_predictions.csv")
+pred <- allpred[Open == 1 & Sales > 0]
+stopifnot(!anyNA(pred$Prediction))
+stopifnot(all(pred[, .(same = uniqueN(.SD[, .N, by = Model]$N) == 1), by = .(Origin, Window)]$same))
+
+res <- pred[, .(RMSE = sqrt(mean((Sales - Prediction)^2)),
+                MAE = mean(abs(Sales - Prediction)), N = .N),
+            by = .(Origin, Window, Model)]
+full <- fread("thesis_tables/arimax_comparison.csv")[Model %in% unique(res$Model)]
+full <- full[, .(Origin = as.Date(Origin), Window = "Full history", Model, RMSE, MAE, N)]
+res <- rbind(res, full)
+res[, Window := factor(Window, levels = c("3 months", "6 months", "12 months", "Full history"))]
+setorder(res, Origin, Window, RMSE)
+fwrite(res, "thesis_tables/arimax_history.csv")
+dcast(res, Origin + Window ~ Model, value.var = "RMSE")[, lapply(.SD, function(x)
+  if (is.numeric(x)) round(x) else x)]
+```
+
+ARIMAX run time per window (minutes, 50 stores):
+
+```{r timing}
+unique(allpred[, .(Origin, Window, ARIMAX_minutes)])
+```
+
+# 6. LightGBM vs ARIMAX: paired block-bootstrap intervals
+
+Same procedure as the main check: LightGBM MSE minus ARIMAX MSE, circular
+seven-day blocks of daily pooled squared losses, 2000 resamples. Negative
+values favour LightGBM.
+
+```{r bootstrap}
+daily <- pred[, .(SSE = sum((Sales - Prediction)^2), N = .N), by = .(Origin, Window, Model, Date)]
+set.seed(BOOT_SEED)
+ci <- list()
+for (w in names(WINDOWS)) for (k in seq_along(ORIGINS)) {
+  o <- ORIGINS[k]
+  a <- daily[Origin == o & Window == w & Model == "ARIMAX"][order(Date)]
+  b <- daily[Origin == o & Window == w & Model == "LightGBM"][order(Date)]
+  stopifnot(identical(a$Date, b$Date), identical(a$N, b$N), nrow(a) == H)
+  boot <- replicate(2000, {
+    j <- unlist(lapply(sample.int(H, H / 7, TRUE), function(s) ((s - 1 + 0:6) %% H) + 1))
+    sum(b$SSE[j] - a$SSE[j]) / sum(a$N[j])
+  })
+  q <- quantile(boot, c(.025, .975))
+  ci[[length(ci) + 1]] <- data.table(Origin = o, Window = w,
+    Comparison = "LightGBM minus ARIMAX",
+    MSE_difference = sum(b$SSE - a$SSE) / sum(a$N), Lower = q[1], Upper = q[2])
+}
+ci <- rbindlist(ci)
+# Full-history interval from the main check, for the same comparison.
+fci <- fread("thesis_tables/arimax_uncertainty.csv")[Comparison == "LightGBM minus ARIMAX"]
+# The main file stores comparator minus ARIMAX, i.e. the same sign convention.
+fci <- fci[, .(Origin = as.Date(Origin), Window = "Full history", Comparison,
+               MSE_difference, Lower, Upper)]
+ci <- rbind(ci, fci)
+fwrite(ci, "thesis_tables/arimax_history_ci.csv")
+ci[, Reading := fifelse(Upper < 0, "favours LightGBM",
+                fifelse(Lower > 0, "favours ARIMAX", "includes zero"))]
+ci
+```
+
+# 7. Figure
+
+```{r figure, fig.width=8, fig.height=4}
+plot_hist <- function() {
+  par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+  cols <- c(ARIMAX = "#b2182b", LightGBM = "#2166ac", XGBoost = "#67a9cf", `Store-DOW` = "grey50")
+  for (o in as.character(ORIGINS)) {
+    d <- res[as.character(Origin) == o]
+    plot(NA, xlim = c(1, 4), ylim = range(res$RMSE), xaxt = "n",
+         xlab = "Training history", ylab = "RMSE (EUR)", main = paste("Origin", o))
+    axis(1, at = 1:4, labels = c("3m", "6m", "12m", "Full"))
+    for (m in names(cols)) {
+      z <- d[Model == m][order(Window)]
+      lines(as.integer(z$Window), z$RMSE, type = "b", pch = 19, col = cols[[m]], lwd = 2)
+    }
+    if (o == as.character(ORIGINS[1]))
+      legend("topright", names(cols), col = cols, lwd = 2, pch = 19, bty = "n", cex = .8)
+  }
+}
+plot_hist()
+pdf("rossmann_outputs/fig_arimax_history.pdf", width = 8, height = 4); plot_hist(); invisible(dev.off())
+```
+
+# 8. Reading the result
+
+Compare the LightGBM-minus-ARIMAX intervals from "Full history" down to
+"3 months". The hypothesis is supported if they move below zero (towards
+LightGBM) as the window shrinks, and contradicted if they stay at or above
+zero.
+
+```{r session}
+sessionInfo()
+```

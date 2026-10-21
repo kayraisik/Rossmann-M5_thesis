@@ -1,0 +1,151 @@
+---
+title: "Verification: Training-Length (Pred 2) and Store-Type (Pred 3)"
+author: "Kayra Isik"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_pred23_verify.Rmd
+  PURPOSE   Independent re-run of the training-length and store-type experiments
+            (Predictions 2 and 3) on a separately written pipeline.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   none; results are read from the rendered HTML
+  THESIS    No table of its own. It is a check on Tables 13 and 14.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      cache = FALSE, fig.align = "center")
+```
+
+# Purpose
+
+A self-contained re-run of the two Stage 2 experiments behind Predictions 2 and 3,
+on the same pipeline used everywhere else (no `source()`). It recomputes the
+training-window-length and store-type gains live so they can be checked against
+the thesis tables (`tab:stage2_window`, `tab:stage2_type`) and any stale value
+caught, the way the number-of-stores experiment was re-checked in Stage 6.
+
+# 1. Packages, data, pipeline
+
+```{r packages}
+library(tidyverse); library(lubridate); library(xgboost); library(lightgbm)
+TRAIN_CSV <- "train.csv"; STORE_CSV <- "store.csv"
+TEST_DAYS <- 42; VAL_FRAC <- 0.15; SEED <- 42
+N_THREADS <- max(1L, parallel::detectCores() - 1L); set.seed(SEED)
+```
+
+```{r load}
+train_raw <- read_csv(TRAIN_CSV, show_col_types = FALSE) %>% mutate(Date = as.Date(Date))
+store_raw <- read_csv(STORE_CSV, show_col_types = FALSE)
+df <- train_raw %>% filter(Open == 1, Sales > 0) %>% left_join(store_raw, by = "Store") %>%
+  mutate(Year=year(Date), Month=month(Date), Week=isoweek(Date), DayOfMonth=mday(Date),
+         Quarter=quarter(Date), IsWeekend=as.integer(DayOfWeek %in% c(6,7)),
+         StateHoliday=case_when(StateHoliday=="a"~1L,StateHoliday=="b"~2L,StateHoliday=="c"~3L,TRUE~0L),
+         CompetitionOpenMonths=ifelse(!is.na(CompetitionOpenSinceYear)&!is.na(CompetitionOpenSinceMonth),
+           (Year-CompetitionOpenSinceYear)*12+(Month-CompetitionOpenSinceMonth),NA_real_),
+         CompetitionOpenMonths=pmax(CompetitionOpenMonths,0,na.rm=TRUE),
+         StoreType=as.integer(factor(StoreType,levels=c("a","b","c","d"))),
+         Assortment=as.integer(factor(Assortment,levels=c("a","b","c")))) %>%
+  mutate(CompetitionDistance=replace_na(CompetitionDistance, median(CompetitionDistance,na.rm=TRUE)),
+         CompetitionOpenMonths=replace_na(CompetitionOpenMonths,0)) %>%
+  arrange(Date, Store)
+FEAT_S1 <- c("Store","DayOfWeek","Promo","StateHoliday","SchoolHoliday","StoreType","Assortment",
+             "CompetitionDistance","Promo2","Year","Month","Week","DayOfMonth","Quarter",
+             "IsWeekend","CompetitionOpenMonths")
+cat("rows:", nrow(df), "| stores:", n_distinct(df$Store), "\n")
+```
+
+```{r pipeline}
+eval_rmse <- function(a,p) sqrt(mean((a-p)^2))
+delta_rel <- function(ref,x) (ref-x)/ref*100
+
+# split with an optional training-window length (in months); test = final 42 days
+split_data <- function(data, feats, train_months = NULL) {
+  d <- sort(unique(data$Date)); cutoff <- d[length(d) - TEST_DAYS]
+  test <- data %>% filter(Date > cutoff)
+  tr   <- data %>% filter(Date <= cutoff)
+  if (!is.null(train_months)) tr <- tr %>% filter(Date > cutoff %m-% months(train_months))
+  list(Xtr=as.matrix(tr[,feats]), ytr=tr$Sales, Xte=as.matrix(test[,feats]),
+       yte=test$Sales, tr=tr, te=test)
+}
+val_idx <- function(tr){ d<-sort(unique(tr$Date)); cut<-d[floor(length(d)*(1-VAL_FRAC))]; which(tr$Date>cut) }
+
+run_store_mean <- function(sp){ m<-sp$tr %>% group_by(Store) %>% summarise(mu=mean(Sales),.groups="drop")
+  gm<-mean(sp$tr$Sales); p<-sp$te %>% left_join(m,by="Store") %>% mutate(p=coalesce(mu,gm)) %>% pull(p)
+  eval_rmse(sp$yte,p) }
+run_store_dow <- function(sp){ dm<-sp$tr %>% group_by(Store,DayOfWeek) %>% summarise(md=mean(Sales),.groups="drop")
+  m<-sp$tr %>% group_by(Store) %>% summarise(mu=mean(Sales),.groups="drop"); gm<-mean(sp$tr$Sales)
+  p<-sp$te %>% left_join(dm,by=c("Store","DayOfWeek")) %>% left_join(m,by="Store") %>%
+     mutate(p=coalesce(md,mu,gm)) %>% pull(p); eval_rmse(sp$yte,p) }
+
+run_xgb <- function(sp){ vi<-val_idx(sp$tr); ti<-setdiff(seq_along(sp$ytr),vi)
+  pr<-list(objective="reg:squarederror",eta=0.10,max_depth=6,subsample=0.8,
+           colsample_bytree=0.8,nthread=N_THREADS,verbosity=0)
+  es<-xgb.train(pr,xgb.DMatrix(sp$Xtr[ti,],label=sp$ytr[ti]),nrounds=1500,
+       watchlist=list(v=xgb.DMatrix(sp$Xtr[vi,],label=sp$ytr[vi])),early_stopping_rounds=50,verbose=0)
+  fit<-xgb.train(pr,xgb.DMatrix(sp$Xtr,label=sp$ytr),nrounds=es$best_iteration,verbose=0)
+  eval_rmse(sp$yte,predict(fit,xgb.DMatrix(sp$Xte))) }
+run_lgb <- function(sp){ vi<-val_idx(sp$tr); ti<-setdiff(seq_along(sp$ytr),vi)
+  pr<-list(objective="regression",metric="rmse",num_leaves=63,learning_rate=0.05,
+           bagging_fraction=0.8,bagging_freq=1,feature_fraction=0.8,num_threads=N_THREADS,seed=SEED,verbosity=-1)
+  es<-lgb.train(pr,lgb.Dataset(sp$Xtr[ti,],label=sp$ytr[ti]),nrounds=2000,
+       valids=list(v=lgb.Dataset(sp$Xtr[vi,],label=sp$ytr[vi])),early_stopping_rounds=50,verbose=-1)
+  fit<-lgb.train(pr,lgb.Dataset(sp$Xtr,label=sp$ytr),nrounds=es$best_iter,verbose=-1)
+  eval_rmse(sp$yte,predict(fit,sp$Xte)) }
+
+score <- function(sp){ rm<-run_store_mean(sp); rd<-run_store_dow(sp)
+  rx<-run_xgb(sp); rl<-run_lgb(sp)
+  tibble(naive_RMSE=round(rm), DOW_RMSE=round(rd), DOW_delta=round(delta_rel(rm,rd),1),
+         XGB_RMSE=round(rx), XGB_drel=round(delta_rel(rm,rx),1),
+         LGB_RMSE=round(rl), LGB_drel=round(delta_rel(rm,rl),1)) }
+```
+
+# 2. Prediction 2 — training-window length
+
+Thesis (`tab:stage2_window`): XGB $\Delta_{\text{rel}}$ 29.8 / 49.1 / 47.2 / 48.3 / 48.9
+and LGBM 36.8 / 49.9 / 47.7 / 48.9 / 47.6 for 6 / 12 / 18 / 24 / full months.
+
+```{r pred2, cache=TRUE}
+windows <- list("6 months"=6, "12 months"=12, "18 months"=18, "24 months"=24, "Full"=NULL)
+pred2 <- imap_dfr(windows, function(m, nm) score(split_data(df, FEAT_S1, m)) %>% mutate(Window=nm, .before=1))
+pred2
+```
+
+# 3. Prediction 3 — store-type composition
+
+Thesis (`tab:stage2_type`): XGB $\Delta_{\text{rel}}$ 49.2 (A) / 61.7 (B) / 50.5 (A+B) / 46.9 (Full)
+and LGBM 50.9 / 60.9 / 51.1 / 47.6.
+
+```{r pred3, cache=TRUE}
+# Each type alone (A,B,C,D) plus a balanced two-type mix (C+D) and the full sample.
+# A+B is dropped: with only 17 Type-B stores against 602 Type-A, A+B is ~97% A.
+subsets <- list("A only"=1L, "B only"=2L, "C only"=3L, "D only"=4L,
+                "C+D"=c(3L,4L), "Full"=1:4)
+pred3 <- imap_dfr(subsets, function(types, nm)
+  score(split_data(df %>% filter(StoreType %in% types), FEAT_S1)) %>% mutate(Subset=nm, .before=1))
+pred3
+```
+
+# 4. Read-off
+
+```{r verdict}
+cat("Pred 2: gain should jump from 6 to 12 months, then flatten (partially supported).\n")
+cat("Pred 3: Type B (smallest, most distinctive weekly pattern) should show the LARGEST gain,\n",
+    "       contradicting the homogeneity prediction but matching Var(delta).\n")
+```
+
+```{r session}
+sessionInfo()
+```

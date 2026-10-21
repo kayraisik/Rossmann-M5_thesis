@@ -1,0 +1,154 @@
+---
+title: "Rossmann — why XGBoost fails in the six-month training window"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    theme: flatly
+    code_folding: show
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_window6_diagnostic.Rmd
+  PURPOSE   Diagnoses the six-month training-window XGBoost result of Stage 2.2
+            (Table 13). Uses one fitted six-month XGBoost model and compares
+            its test predictions with counterfactual predictions in which one
+            input is changed. No model is retrained when the saved model exists.
+  INPUTS    train.csv, store.csv, rossmann_stages2_4.Rmd (pipeline chunk only),
+            xgb_6m_model.rds (optional; fitted and saved here if missing).
+  OUTPUTS   thesis_tables/stage2_window_diag.csv (one row).
+  THESIS    Section 4.3.2, Dimension 2, six-month paragraph.
+
+  The pipeline (data, features, split_window, run_xgboost, ...) is taken from
+  the pipeline chunk of rossmann_stages2_4.Rmd, so the six-month split and the
+  model settings are exactly those of Table 13.
+
+  Runtime: about 5 minutes with xgb_6m_model.rds (the SHAP step dominates).
+  Without it, the six-month model is fitted first (2 x 1500 rounds).
+  Render it from the R session that saved xgb_6m_model.rds (same xgboost
+  version), e.g. rmarkdown::render("rossmann_window6_diagnostic.Rmd").
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Pipeline and model
+
+```{r pipeline}
+# Run the code of the pipeline chunk directly. knitr::purl() cannot be used
+# here: it is itself a knit, and inside this knit it clashes with our chunk
+# labels (both files have a 'setup' chunk).
+lines <- readLines("rossmann_stages2_4.Rmd")
+start <- grep("^```\\{r pipeline", lines)[1]
+end   <- start + which(grepl("^```\\s*$", lines[(start + 1):length(lines)]))[1]
+eval(parse(text = lines[(start + 1):(end - 1)]), envir = globalenv())
+
+sp   <- split_window(df, FEAT_S1, max(df$Date), months = 6)
+X_te <- sp$X_test; Xtr <- sp$X_train
+
+# A saved booster can only be used by the xgboost version that saved it
+# (3.x boosters read under 1.7 come back as a plain list). The saved model is
+# used only if it predicts; otherwise the model is fitted again and saved.
+MODEL_RDS <- "xgb_6m_model.rds"
+model <- if (file.exists(MODEL_RDS)) tryCatch(readRDS(MODEL_RDS), error = function(e) NULL) else NULL
+model_loaded <- inherits(model, "xgb.Booster") &&
+  !is.null(tryCatch(predict(model, xgb.DMatrix(X_te[1:2, , drop = FALSE])), error = function(e) NULL))
+if (!model_loaded) {
+  model <- run_xgboost(sp, return_model = TRUE)$model
+  saveRDS(model, MODEL_RDS)
+}
+c(xgboost = as.character(packageVersion("xgboost")), model_loaded = model_loaded)
+```
+
+```{r helpers}
+bm   <- run_store_mean(sp)$RMSE
+gain <- function(pred) delta_rel(bm, eval_metrics(sp$y_test, pred)$RMSE)
+pred_with <- function(col, value) { X <- X_te; X[, col] <- value; predict(model, xgb.DMatrix(X)) }
+p0 <- predict(model, xgb.DMatrix(X_te))
+```
+
+# 1. Level of the forecasts
+
+```{r level}
+sm   <- tapply(sp$y_train, sp$train$Store, mean)
+p_sm <- sm[as.character(X_te[, "Store"])]
+sb   <- tapply(p0 - sp$y_test, X_te[, "Store"], mean)
+pr0  <- X_te[, "Promo"] == 0
+level <- tibble(
+  gain_orig        = gain(p0),
+  actual_mean      = mean(sp$y_test),
+  xgb_pred_mean    = mean(p0),
+  xgb_bias         = mean(p0 - sp$y_test),
+  storemean_bias   = mean(p_sm - sp$y_test),
+  share_stores_over = mean(sb > 0),
+  bias_promo0      = mean(p0[pr0] - sp$y_test[pr0]),
+  bias_promo1      = mean(p0[!pr0] - sp$y_test[!pr0]),
+  train_bias_max   = max(abs(tapply(predict(model, xgb.DMatrix(Xtr)) - sp$y_train, Xtr[, "Month"], mean))))
+level
+```
+
+# 2. Which input carries the shift (SHAP)
+
+Mean SHAP contribution on 5000 test rows minus that on 5000 training rows from
+the last two training months (May-June).
+
+```{r shap}
+set.seed(1)
+last <- which(Xtr[, "Month"] %in% c(5, 6))
+i_te <- sample(nrow(X_te), 5000); i_tr <- sample(last, 5000)
+c_te <- predict(model, xgb.DMatrix(X_te[i_te, ]), predcontrib = TRUE)
+c_tr <- predict(model, xgb.DMatrix(Xtr[i_tr, ]),  predcontrib = TRUE)
+shap_diff <- sort(colMeans(c_te) - colMeans(c_tr), decreasing = TRUE)
+round(shap_diff)
+```
+
+# 3. Week: unseen test weeks and the last training week
+
+The training window has ISO weeks 1 to `r max(Xtr[Xtr[, "Week"] < 40, "Week"])`
+and the December weeks; the test weeks are
+`r min(X_te[, "Week"])` to `r max(X_te[, "Week"])`. A tree split on Week can
+only fall at a value seen in training, so every test week goes to the same
+branch as the last training week in every tree.
+
+```{r week}
+last_wk <- max(Xtr[Xtr[, "Week"] < 40, "Week"])
+wk_tab <- tibble(Week = sort(unique(Xtr[, "Week"]))) %>%
+  mutate(days        = sapply(Week, function(w) n_distinct(sp$train$Date[Xtr[, "Week"] == w])),
+         promo_share = sapply(Week, function(w) mean(Xtr[Xtr[, "Week"] == w, "Promo"])),
+         mean_sales  = sapply(Week, function(w) mean(sp$y_train[Xtr[, "Week"] == w])))
+wk_tab %>% filter(Week >= last_wk - 3)
+
+tr_dt <- xgb.model.dt.tree(model = model)
+n_split_last <- sum(tr_dt$Feature == "Week" & tr_dt$Split == last_wk, na.rm = TRUE)
+
+cf <- map_dfr(c(last_wk, 20, 23, last_wk - 1), function(w) {
+  p <- pred_with("Week", w); tibble(Week = w, pred_mean = mean(p), gain = gain(p)) })
+cf
+```
+
+# Output for the thesis
+
+```{r write}
+w_last <- wk_tab %>% filter(Week == last_wk); w_prev <- wk_tab %>% filter(Week == last_wk - 1)
+cf_prev <- cf %>% filter(Week == last_wk - 1)
+diag <- level %>% mutate(
+  xgboost_version   = as.character(packageVersion("xgboost")),
+  model_loaded      = model_loaded,
+  test_week_min     = min(X_te[, "Week"]), test_week_max = max(X_te[, "Week"]),
+  last_train_week   = last_wk,
+  last_week_days    = w_last$days,  last_week_promo_share = w_last$promo_share,
+  last_week_sales   = w_last$mean_sales, prev_week_sales = w_prev$mean_sales,
+  prev_week_promo_share = w_prev$promo_share,
+  n_split_last_week = n_split_last,
+  shap_week = unname(shap_diff["Week"]), shap_total = sum(shap_diff),
+  cf_week_prev_pred_mean = cf_prev$pred_mean, cf_week_prev_gain = cf_prev$gain,
+  cf_week_min_gain  = min(cf$gain[cf$Week != last_wk]),
+  cf_week_max_gain  = max(cf$gain[cf$Week != last_wk])) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+t(diag)
+# Written for the thesis: Section 4.3.2 six-month paragraph. Do not edit the CSV.
+dir.create("thesis_tables", showWarnings = FALSE)
+write_csv(diag, "thesis_tables/stage2_window_diag.csv")
+```

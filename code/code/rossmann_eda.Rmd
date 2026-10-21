@@ -1,0 +1,263 @@
+---
+title: "Data Description and Exploratory Analysis (Rossmann)"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_eda.Rmd
+  PURPOSE   Data description and exploratory analysis of the Rossmann panel.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   eda_outputs/fig_eda_*.pdf
+  THESIS    Table 5 (descriptive statistics). The exploratory FIGURES printed in the
+            thesis are not taken from here: the .Rnw regenerates them from the raw
+            data at compile time and writes them to the same folder.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 4.5)
+set.seed(42)
+```
+
+# Purpose
+
+A full description of the Rossmann data for the Data chapter of the thesis: the
+variables, descriptive statistics of the target, the within-week and
+within-year structure, promotion and store-type effects, an individual-store
+view, and a check of the observed properties against the assumptions behind the
+decomposition model. Every figure is written to `eda_outputs/` as a PDF so it
+can be dropped straight into the LaTeX Data section, and the key tables are
+printed here for the descriptive-statistics and feature tables.
+
+```{r packages}
+library(tidyverse)
+library(lubridate)
+BLUE <- "#4C72B0"; RED <- "#C44E52"; GREY <- "grey40"
+theme_set(theme_minimal(base_size = 12))
+dir.create("eda_outputs", showWarnings = FALSE)
+save_fig <- function(p, name, w = 5, h = 4)
+  ggsave(file.path("eda_outputs", name), p, width = w, height = h)
+```
+
+# 1. Raw to final modelling sample
+
+```{r load}
+train_raw <- read_csv("train.csv", show_col_types = FALSE) %>% mutate(Date = as.Date(Date))
+store_raw <- read_csv("store.csv", show_col_types = FALSE)
+
+steps <- tibble(
+  Step = c("Raw train.csv rows",
+           "After removing closed days (Open = 0)",
+           "After also removing zero-sales open days",
+           "Final modelling sample"),
+  Rows = c(nrow(train_raw),
+           nrow(filter(train_raw, Open == 1)),
+           nrow(filter(train_raw, Open == 1, Sales > 0)),
+           nrow(filter(train_raw, Open == 1, Sales > 0))))
+steps
+```
+
+```{r build}
+df <- train_raw %>% filter(Open == 1, Sales > 0) %>%
+  left_join(store_raw, by = "Store") %>%
+  mutate(Month     = month(Date, label = TRUE),
+         MonthNum  = month(Date),
+         YearMonth = floor_date(Date, "month"),
+         DOW       = factor(DayOfWeek, levels = 1:7,
+                            labels = c("Mon","Tue","Wed","Thu","Fri","Sat","Sun")),
+         StoreType = factor(StoreType, levels = c("a","b","c","d"),
+                            labels = c("A","B","C","D")),
+         Promo     = factor(Promo, levels = c(0,1), labels = c("No promo","Promo")))
+cat("Final sample:", nrow(df), "open store-days,", n_distinct(df$Store), "stores,",
+    as.character(min(df$Date)), "to", as.character(max(df$Date)), "\n")
+```
+
+# 2. Descriptive statistics of the target
+
+```{r desc-stats}
+sk <- function(x){ x <- x[is.finite(x)]; m <- mean(x); s <- sd(x); mean(((x-m)/s)^3) }
+desc <- tibble(
+  Statistic = c("Mean","Median","Std Dev","Min","Max","Skewness"),
+  Value = c(mean(df$Sales), median(df$Sales), sd(df$Sales),
+            min(df$Sales), max(df$Sales), sk(df$Sales)))
+desc %>% mutate(Value = round(Value, 2))
+# Written for the thesis: Table 5 (descriptive statistics, open days only).
+dir.create("thesis_tables", showWarnings = FALSE)
+readr::write_csv(desc %>% mutate(Value = round(Value, 2)),
+                 "thesis_tables/descriptive_stats.csv")
+```
+
+```{r fig1-distribution}
+p_raw <- ggplot(df, aes(Sales)) +
+  geom_histogram(bins = 60, fill = BLUE) +
+  labs(x = "Daily sales (EUR)", y = "Count", title = "Raw")
+p_log <- ggplot(df, aes(log(Sales))) +
+  geom_histogram(bins = 60, fill = BLUE) +
+  labs(x = "log(daily sales)", y = "Count", title = "Log-transformed")
+print(p_raw); print(p_log)
+save_fig(p_raw, "fig_eda_dist_raw.pdf"); save_fig(p_log, "fig_eda_dist_log.pdf")
+```
+
+# 3. Trend and seasonality
+
+```{r fig2-over-time, fig.height=4}
+p_time <- df %>% group_by(YearMonth) %>%
+  summarise(mean_sales = mean(Sales), .groups = "drop") %>%
+  ggplot(aes(YearMonth, mean_sales)) +
+  geom_line(colour = BLUE, linewidth = 1) + geom_point(colour = BLUE) +
+  labs(x = NULL, y = "Mean daily sales (EUR)",
+       title = "Average daily sales over time (monthly)")
+print(p_time); save_fig(p_time, "fig_eda_sales_over_time.pdf", w = 8, h = 4)
+```
+
+```{r fig3-seasonality}
+p_dow <- df %>% group_by(DOW) %>% summarise(m = mean(Sales), .groups="drop") %>%
+  ggplot(aes(DOW, m)) + geom_col(fill = BLUE) +
+  labs(x = NULL, y = "Mean sales (EUR)", title = "By day of week")
+p_mon <- df %>% group_by(Month) %>% summarise(m = mean(Sales), .groups="drop") %>%
+  ggplot(aes(Month, m, group = 1)) + geom_line(colour = BLUE, linewidth = 1) +
+  geom_point(colour = BLUE) + labs(x = NULL, y = NULL, title = "By month")
+print(p_dow); print(p_mon)
+save_fig(p_dow, "fig_eda_dow.pdf"); save_fig(p_mon, "fig_eda_month.pdf")
+```
+
+# 4. Promotions and store types
+
+```{r fig4-promo-type}
+p_promo <- df %>% group_by(Promo) %>% summarise(m = mean(Sales), .groups="drop") %>%
+  ggplot(aes(Promo, m, fill = Promo)) + geom_col() +
+  scale_fill_manual(values = c(GREY, RED)) +
+  labs(x = NULL, y = "Mean sales (EUR)", title = "Promotion effect") +
+  theme(legend.position = "none")
+p_type <- df %>% group_by(StoreType) %>% summarise(m = mean(Sales), .groups="drop") %>%
+  ggplot(aes(StoreType, m, fill = StoreType)) + geom_col() +
+  labs(x = "Store type", y = NULL, title = "By store type") +
+  theme(legend.position = "none")
+print(p_promo); print(p_type)
+save_fig(p_promo, "fig_eda_promo.pdf"); save_fig(p_type, "fig_eda_storetype.pdf")
+```
+
+```{r fig-violin, fig.height=4}
+p_violin <- ggplot(df, aes(StoreType, Sales, fill = StoreType)) +
+  geom_violin(alpha = .7) + geom_boxplot(width = .12, outlier.size = .2, fill = "white") +
+  labs(x = "Store type", y = "Daily sales (EUR)",
+       title = "Sales distribution by store type") +
+  theme(legend.position = "none")
+print(p_violin); save_fig(p_violin, "fig_eda_storetype_violin.pdf", w = 7, h = 4)
+```
+
+# 5. An individual store
+
+```{r fig5-store}
+set.seed(1); s_id <- 1
+s1 <- df %>% filter(Store == s_id) %>% arrange(Date)
+p_hist <- ggplot(s1, aes(Date, Sales)) + geom_line(colour = BLUE, linewidth = .3) +
+  labs(x = NULL, y = "Daily sales (EUR)", title = paste0("Store ", s_id, ": full history"))
+p_spromo <- s1 %>% group_by(Promo) %>% summarise(m = mean(Sales), .groups="drop") %>%
+  ggplot(aes(Promo, m, fill = Promo)) + geom_col() +
+  scale_fill_manual(values = c(GREY, RED)) +
+  labs(x = NULL, y = "Mean sales (EUR)", title = paste0("Store ", s_id, ": promotion effect")) +
+  theme(legend.position = "none")
+print(p_hist); print(p_spromo)
+save_fig(p_hist, "fig_eda_store_history.pdf", w = 7, h = 3.5)
+save_fig(p_spromo, "fig_eda_store_promo.pdf", w = 4, h = 3.5)
+```
+
+```{r fig-examples-by-type, fig.height=5}
+samp <- df %>% distinct(Store, StoreType) %>% group_by(StoreType) %>%
+  slice_sample(n = 1) %>% pull(Store)
+p_ex <- df %>% filter(Store %in% samp) %>%
+  ggplot(aes(Date, Sales)) + geom_line(linewidth = .25, colour = BLUE) +
+  facet_wrap(~ paste0("Store ", Store, " (Type ", StoreType, ")"),
+             ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = "Daily sales (EUR)",
+       title = "Example store series, one per store type")
+print(p_ex); save_fig(p_ex, "fig_eda_example_series.pdf", w = 9, h = 5)
+```
+
+# 6. Feature relationships
+
+```{r fig-competition, fig.height=4}
+p_comp <- df %>% filter(!is.na(CompetitionDistance)) %>%
+  mutate(dist_bin = cut(CompetitionDistance,
+                        breaks = quantile(CompetitionDistance, 0:10/10, na.rm = TRUE),
+                        include.lowest = TRUE)) %>%
+  group_by(dist_bin) %>%
+  summarise(m = mean(Sales), mid = median(CompetitionDistance), .groups = "drop") %>%
+  ggplot(aes(mid, m)) + geom_line(colour = BLUE) + geom_point(colour = BLUE) +
+  labs(x = "Competitor distance (m, decile midpoints)", y = "Mean sales (EUR)",
+       title = "Sales vs. competitor distance")
+print(p_comp); save_fig(p_comp, "fig_eda_competition.pdf", w = 7, h = 4)
+```
+
+```{r fig-corr, fig.height=5}
+num <- df %>% transmute(Sales, DayOfWeek, Promo = as.integer(Promo) - 1,
+                        SchoolHoliday, CompetitionDistance,
+                        Promo2, Month = MonthNum) %>%
+  mutate(across(everything(), as.numeric)) %>% drop_na()
+cc <- cor(num)
+p_corr <- as_tibble(cc, rownames = "x") %>%
+  pivot_longer(-x, names_to = "y", values_to = "r") %>%
+  ggplot(aes(x, y, fill = r)) + geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 3) +
+  scale_fill_gradient2(low = RED, mid = "white", high = BLUE, midpoint = 0, limits = c(-1,1)) +
+  labs(x = NULL, y = NULL, title = "Correlations among numeric features") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_corr); save_fig(p_corr, "fig_eda_corr.pdf", w = 6.5, h = 5.5)
+```
+
+# 7. Store types summary table
+
+```{r storetype-table}
+v_by_store <- df %>% group_by(Store) %>%
+  summarise(v = var(Sales),
+            v_dow = var(ave(Sales, DOW)),
+            .groups = "drop") %>%
+  mutate(weekly_share = v_dow / v)
+type_tab <- df %>% group_by(Store, StoreType) %>%
+  summarise(mean_sales = mean(Sales), .groups = "drop") %>%
+  left_join(v_by_store, by = "Store") %>%
+  group_by(StoreType) %>%
+  summarise(Stores = n(),
+            `Mean open-day sales (EUR)` = round(mean(mean_sales)),
+            `Weekly-predictable share` = round(mean(weekly_share, na.rm = TRUE), 2),
+            .groups = "drop")
+type_tab
+# Written for the thesis: Table 6 (store types). The Sunday-opening column of
+# that table comes from rossmann_thesis_extensions.Rmd (tab_e8_store_types.csv).
+dir.create("thesis_tables", showWarnings = FALSE)
+readr::write_csv(type_tab, "thesis_tables/store_types.csv")
+```
+
+# 8. Decomposition view (assumptions check)
+
+The model writes sales as a store level plus predictable, systematic, and noise
+components, $y_{s,t} = \mu_s + \delta_{s,t} + \phi_{s,t} + \varepsilon_{s,t}$.
+An STL decomposition of one store's open-day series shows the trend, the weekly
+seasonal piece (a visual of $\delta$), and the remainder, and indicates how
+stable the store level $\mu_s$ is over the sample.
+
+```{r fig-stl, fig.height=6}
+ts1 <- ts(s1$Sales, frequency = 7)
+dec <- stl(ts1, s.window = "periodic")
+pdf("eda_outputs/fig_eda_stl.pdf", width = 8, height = 6)
+plot(dec, main = paste("STL decomposition, Store", s_id))
+dev.off()
+plot(dec, main = paste("STL decomposition, Store", s_id))
+```
+
+```{r session}
+sessionInfo()
+```

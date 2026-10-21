@@ -1,0 +1,330 @@
+---
+title: "Rossmann — Covariate-Matched ARIMAX Robustness Check"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_arimax.Rmd
+  PURPOSE   Gives regression with ARIMA errors (ARIMAX), XGBoost and LightGBM
+            the same observed covariates on a fixed sample of 50 stores and two
+            forecast origins, so that the tree-vs-statistical comparison is not
+            driven by the statistical models seeing less information.
+  INPUTS    train.csv, store.csv (same folder, like the other stage files)
+  OUTPUTS   thesis_tables/arimax_comparison.csv    RMSE/MAE per origin and model
+            thesis_tables/arimax_uncertainty.csv   block-bootstrap intervals
+            rossmann_outputs/arimax_predictions.csv  every store-day forecast
+            rossmann_outputs/arimax_sample.csv       the 50 sampled stores
+            rossmann_outputs/arimax_model_manifest.csv  chosen ARIMA orders
+  THESIS    Section "Covariate-Matched ARIMAX Robustness Check":
+            Table tab:arimax, Table tab:arimax_ci and the numbers in the text.
+            The thesis .Rnw does NOT run this file; it only reads the two
+            thesis_tables/ CSVs, so knit this file first.
+  NOTE      The two model chunks are cached, so only the first knit is slow
+            (roughly 10-30 minutes, 200 per-store auto.arima fits). Auto-ARIMA
+            runs in parallel via mclapply on Unix.
+
+  Self-contained: this file does not source() any other script.
+  Same design as scripts/arimax_check.R in the thesis package.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Purpose
+
+In the main comparisons Auto-ARIMA, ETS and Theta see only a store's own sales
+history, while the tree models also see calendar, promotion and holiday
+variables. A tree advantage could therefore come from the extra information
+rather than from the model class. This file removes that difference: ARIMAX
+and both boosted models receive exactly the same covariates, and every model
+is evaluated on the same store-day rows.
+
+# 1. Packages and data
+
+```{r packages}
+library(data.table)
+library(forecast)
+library(lightgbm)
+library(xgboost)
+
+# Same convention as the other stage files: train.csv and store.csv sit next
+# to this file. A few other usual places are tried as a fallback.
+data_dirs <- c(".", "..", "Data/rossmann-store-sales", "../Data/rossmann-store-sales")
+DATA_DIR  <- data_dirs[file.exists(file.path(data_dirs, "train.csv"))][1]
+if (is.na(DATA_DIR)) stop("train.csv not found in: ", paste(data_dirs, collapse = ", "))
+
+SEED      <- 230923          # sampling and tree seeds
+BOOT_SEED <- 230924          # bootstrap seed
+H         <- 42              # forecast horizon in days
+N_CORES   <- max(1, min(4, parallel::detectCores() - 1))
+ORIGINS   <- as.Date(c("2015-05-08", "2015-06-19"))
+
+dir.create("thesis_tables",    showWarnings = FALSE)
+dir.create("rossmann_outputs", showWarnings = FALSE)
+
+raw <- fread(file.path(DATA_DIR, "train.csv"))
+raw[, Date := as.Date(Date)]
+stores <- fread(file.path(DATA_DIR, "store.csv"))
+
+cat("Data folder:", normalizePath(DATA_DIR), "\n")
+cat("Installed versions: forecast", as.character(packageVersion("forecast")),
+    "| lightgbm", as.character(packageVersion("lightgbm")),
+    "| xgboost", as.character(packageVersion("xgboost")), "\n")
+```
+
+# 2. Store sample
+
+The sample is fixed before any model is fitted. Only stores with a complete
+daily record from 1 January 2013 up to the first origin are eligible, and this
+is checked using data available at that origin only. Fifty stores are drawn,
+stratified by store type (27 A, 1 B, 7 C, 15 D).
+
+```{r sample}
+set.seed(SEED)
+eligible <- raw[Date <= ORIGINS[1], .(n = .N, first = min(Date)), by = Store]
+full_len <- as.integer(ORIGINS[1] - as.Date("2013-01-01")) + 1
+eligible <- eligible[n == full_len & first == as.Date("2013-01-01")]
+pool <- merge(eligible, stores[, .(Store, StoreType)], by = "Store")
+
+allocation <- c(a = 27L, b = 1L, c = 7L, d = 15L)
+ids <- unlist(lapply(names(allocation), function(k)
+  sample(sort(pool[StoreType == k, Store]), allocation[[k]])))
+
+fwrite(pool[Store %in% ids], "rossmann_outputs/arimax_sample.csv")
+cat("Eligible stores:", nrow(pool), "| sampled:", length(ids), "\n")
+table(pool[Store %in% ids, StoreType])
+```
+
+# 3. Shared covariates
+
+One design matrix is built once and used by every model: weekday indicators,
+promotion and its weekday interactions, school and state holidays, opening
+status, an annual sine/cosine pair and a linear time index.
+
+```{r covariates}
+raw <- raw[Store %in% ids][order(Store, Date)]
+raw[, DOW := factor(as.integer(format(Date, "%u")), levels = 1:7)]
+raw[, day := as.numeric(Date - as.Date("2013-01-01")) / 365.25]
+raw[, annual_sin := sin(2 * pi * day)]
+raw[, annual_cos := cos(2 * pi * day)]
+raw[, holiday := as.integer(StateHoliday != "0")]
+
+X <- model.matrix(~ DOW * Promo + SchoolHoliday + holiday + Open +
+                    annual_sin + annual_cos + day, raw)[, -1, drop = FALSE]
+colnames(X) <- make.names(colnames(X))
+colnames(X)
+```
+
+# 4. Per-store Auto-ARIMA and ARIMAX
+
+Each store gets its own model. Orders are chosen by AICc with a stepwise,
+approximate search bounded by p, q ≤ 3, P, Q ≤ 1 and a maximum combined order
+of 5, with weekly seasonality. For ARIMAX, regressor columns that are constant
+or linearly dependent **in the training window** are dropped (a QR rank check
+that never looks at test sales). Auto-ARIMA without regressors is the
+within-experiment information ablation.
+
+```{r arima-fns}
+predict_store <- function(s, origin, use_x) {
+  ix <- which(raw$Store == s & raw$Date <= origin)
+  it <- which(raw$Store == s & raw$Date > origin & raw$Date <= origin + H)
+  yy <- ts(raw$Sales[ix], frequency = 7)
+  args <- list(y = yy, seasonal = TRUE, stepwise = TRUE, approximation = TRUE,
+               max.p = 3, max.q = 3, max.P = 1, max.Q = 1, max.order = 5)
+  keep <- integer()
+  if (use_x) {
+    xx <- X[ix, , drop = FALSE]
+    qq <- qr(cbind(Intercept = 1, xx))
+    keep <- sort(qq$pivot[seq_len(qq$rank)])
+    keep <- keep[keep > 1] - 1L
+    args$xreg <- xx[, keep, drop = FALSE]
+  }
+  fit  <- do.call(auto.arima, args)
+  pred <- if (use_x) forecast(fit, xreg = X[it, keep, drop = FALSE], h = length(it))$mean
+          else forecast(fit, h = length(it))$mean
+  list(pred = data.table(Store = s, Date = raw$Date[it], Sales = raw$Sales[it],
+                         Open = raw$Open[it], Prediction = as.numeric(pred)),
+       order = paste(arimaorder(fit), collapse = ","),
+       regressors = paste(colnames(X)[keep], collapse = ";"))
+}
+```
+
+```{r arima-fits, cache=TRUE}
+arima_pred <- list(); manifest <- list()
+for (k in seq_along(ORIGINS)) {
+  origin <- ORIGINS[k]
+  for (use_x in c(FALSE, TRUE)) {
+    model <- if (use_x) "ARIMAX" else "Auto-ARIMA"
+    fits <- parallel::mclapply(ids, function(s)
+      tryCatch(predict_store(s, origin, use_x),
+               error = function(e) list(error = conditionMessage(e), Store = s)),
+      mc.cores = N_CORES)
+    bad <- vapply(fits, function(z) !is.null(z$error), logical(1))
+    # A failed store is an error, not a silent drop from the sample.
+    if (any(bad)) { print(fits[bad]); stop("A store fit failed") }
+    pp <- rbindlist(lapply(fits, `[[`, "pred"))
+    pp[, `:=`(Model = model, Origin = origin)]
+    arima_pred[[length(arima_pred) + 1]] <- pp
+    manifest[[length(manifest) + 1]] <- data.table(
+      Store = ids, Origin = origin, Model = model,
+      Order = vapply(fits, `[[`, "", "order"),
+      Regressors = vapply(fits, `[[`, "", "regressors"))
+    cat(as.character(origin), model, "done\n")
+  }
+}
+```
+
+# 5. Pooled XGBoost and LightGBM, and the Store-DOW baseline
+
+The trees are pooled across the 50 stores and get the same covariates plus
+store indicator columns (so a store's level can be learned without splitting
+on an ordinal store ID). The number of boosting rounds is chosen by early
+stopping on the last 42 training days; the model is then refitted on the full
+training window with that number of rounds. Capacity is fixed: depth 6 for
+XGBoost, 31 leaves for LightGBM.
+
+```{r tree-fns}
+# xgboost < 2 (the server has 1.7.x) names the validation set `watchlist`;
+# later releases call it `evals`. Pick whichever the installed version has.
+xgb_fit_valid <- function(params, dtrain, dvalid) {
+  a <- list(params = params, data = dtrain, nrounds = 1200,
+            early_stopping_rounds = 50, verbose = 0)
+  if ("evals" %in% names(formals(xgb.train))) a$evals <- list(valid = dvalid)
+  else a$watchlist <- list(valid = dvalid)
+  do.call(xgb.train, a)
+}
+# 1.7.x keeps a one-based $best_iteration; later releases only keep the
+# zero-based booster attribute.
+xgb_best <- function(fit) {
+  b <- tryCatch(as.integer(fit$best_iteration), error = function(e) integer())
+  if (!length(b) || is.na(b)) b <- as.integer(xgb.attr(fit, "best_iteration")) + 1L
+  b
+}
+```
+
+```{r tree-fits, cache=TRUE}
+tree_pred <- list(); rounds <- list()
+storex <- model.matrix(~ factor(Store) - 1, raw)
+xx <- cbind(X, storex)
+for (k in seq_along(ORIGINS)) {
+  origin <- ORIGINS[k]
+  ix <- which(raw$Date <= origin)
+  it <- which(raw$Date > origin & raw$Date <= origin + H)
+  trainx <- xx[ix, , drop = FALSE]; yy <- raw$Sales[ix]
+  vv <- which(raw$Date[ix] > origin - H)      # last 42 training days
+  tt <- setdiff(seq_along(ix), vv)
+
+  # LightGBM
+  lp_par <- list(objective = "regression", metric = "rmse", num_leaves = 31,
+                 learning_rate = .05, min_data_in_leaf = 20, num_threads = 4,
+                 seed = SEED, verbosity = -1, deterministic = TRUE,
+                 force_col_wise = TRUE)
+  lv  <- lgb.train(lp_par, lgb.Dataset(trainx[tt, ], label = yy[tt]), nrounds = 1200,
+                   valids = list(valid = lgb.Dataset(trainx[vv, ], label = yy[vv])),
+                   early_stopping_rounds = 50, verbose = -1)
+  lfit <- lgb.train(lp_par, lgb.Dataset(trainx, label = yy), nrounds = lv$best_iter, verbose = -1)
+  lp <- predict(lfit, xx[it, , drop = FALSE])
+
+  # XGBoost
+  xp_par <- list(objective = "reg:squarederror", eta = .05, max_depth = 6,
+                 nthread = 4, seed = SEED)
+  xv   <- xgb_fit_valid(xp_par, xgb.DMatrix(trainx[tt, ], label = yy[tt]),
+                        xgb.DMatrix(trainx[vv, ], label = yy[vv]))
+  bx   <- xgb_best(xv); stopifnot(length(bx) == 1, !is.na(bx))
+  xfit <- xgb.train(xp_par, xgb.DMatrix(trainx, label = yy), nrounds = bx, verbose = 0)
+  xpred <- predict(xfit, xgb.DMatrix(xx[it, , drop = FALSE]))
+
+  rounds[[k]] <- data.table(Origin = origin, LightGBM = lv$best_iter, XGBoost = bx)
+
+  for (model in c("LightGBM", "XGBoost", "Store-DOW")) {
+    pp <- copy(raw[it, .(Store, Date, Sales, Open)])
+    if (model == "Store-DOW") {
+      # Mean open-day sales per store and weekday over the training window.
+      bm <- raw[Date <= origin & Open == 1 & Sales > 0,
+                .(Prediction = mean(Sales)), by = .(Store, DOW)]
+      pp[, DOW := raw$DOW[it]]
+      pp <- merge(pp, bm, by = c("Store", "DOW"), all.x = TRUE, sort = FALSE)
+      pp[, DOW := NULL]
+    } else pp[, Prediction := if (model == "LightGBM") lp else xpred]
+    pp[, `:=`(Model = model, Origin = origin)]
+    tree_pred[[length(tree_pred) + 1]] <- pp
+  }
+  cat(as.character(origin), "trees and baseline done\n")
+}
+rbindlist(rounds)
+```
+
+# 6. Accuracy on identical rows
+
+All models are scored on the same open, positive-sales store-days. The
+checks stop the knit if any forecast is missing or if the models at one
+origin were not evaluated on the same number of rows.
+
+```{r accuracy}
+allpred <- rbindlist(c(arima_pred, tree_pred), use.names = TRUE)
+fwrite(allpred, "rossmann_outputs/arimax_predictions.csv")
+fwrite(rbindlist(manifest), "rossmann_outputs/arimax_model_manifest.csv")
+
+pred <- allpred[Open == 1 & Sales > 0]
+stopifnot(!anyNA(pred$Prediction))
+counts <- pred[, .N, by = .(Origin, Model)]
+stopifnot(all(counts[, .(same = uniqueN(N) == 1), by = Origin]$same))
+
+res <- pred[, .(RMSE = sqrt(mean((Sales - Prediction)^2)),
+                MAE  = mean(abs(Sales - Prediction)),
+                N = .N, Stores = uniqueN(Store)), by = .(Origin, Model)]
+fwrite(res, "thesis_tables/arimax_comparison.csv")
+res
+```
+
+# 7. Paired block-bootstrap intervals
+
+For each origin, ARIMAX is compared with Auto-ARIMA, XGBoost and LightGBM.
+The statistic is comparator MSE minus ARIMAX MSE, so a positive value favours
+ARIMAX. Daily pooled squared losses are resampled in circular blocks of seven
+days (six blocks cover the 42-day holdout), 2000 times. Resampling whole days
+keeps the dependence across stores on the same day, and seven-day blocks keep
+the weekly pattern.
+
+```{r bootstrap}
+daily <- pred[, .(SSE = sum((Sales - Prediction)^2), N = .N), by = .(Origin, Model, Date)]
+set.seed(BOOT_SEED)
+ci <- list()
+for (k in seq_along(ORIGINS)) for (m in c("Auto-ARIMA", "XGBoost", "LightGBM")) {
+  o <- ORIGINS[k]
+  a <- daily[Origin == o & Model == "ARIMAX"][order(Date)]
+  b <- daily[Origin == o & Model == m][order(Date)]
+  stopifnot(identical(a$Date, b$Date), identical(a$N, b$N), nrow(a) == H)
+  boot <- replicate(2000, {
+    starts <- sample.int(H, H / 7, TRUE)
+    j <- unlist(lapply(starts, function(s) ((s - 1 + 0:6) %% H) + 1))
+    sum(b$SSE[j] - a$SSE[j]) / sum(a$N[j])
+  })
+  q <- quantile(boot, c(.025, .975))
+  ci[[length(ci) + 1]] <- data.table(
+    Origin = o, Comparison = paste(m, "minus ARIMAX"),
+    MSE_difference = sum(b$SSE - a$SSE) / sum(a$N), Lower = q[1], Upper = q[2])
+}
+ci <- rbindlist(ci)
+fwrite(ci, "thesis_tables/arimax_uncertainty.csv")
+
+# How the thesis text will read each interval.
+ci[, Reading := fifelse(Lower > 0, "favours ARIMAX",
+                fifelse(Upper < 0, "favours comparator", "includes zero"))]
+ci
+```
+
+# 8. Session
+
+```{r session}
+sessionInfo()
+```

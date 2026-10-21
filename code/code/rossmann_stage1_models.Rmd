@@ -1,0 +1,467 @@
+---
+title: "Rossmann Stage 1 — Tree-Based and Boosting Model Comparison"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_stage1_models.Rmd
+  PURPOSE   Stage 1. Fits the pooled models on the full panel with no lag features:
+            two naive baselines, linear regression, CART, bagging, random forest,
+            gradient boosting written from scratch, XGBoost and LightGBM.
+  INPUTS    train.csv, store.csv (same folder)
+  OUTPUTS   none; results are read from the rendered HTML
+  THESIS    Table 11, rows XGBoost, LightGBM, Bagging, CART, Linear, and the two
+            naive baselines.
+  NOTE      Does NOT fit Auto-ARIMA, ETS or Theta. Those are fitted per store in
+            rossmann_old_m_to_modern_ml_experiment.Rmd.
+            The random forest here uses ranger's default mtry = sqrt(p) and gives
+            1413. The thesis reports 1212, the mtry = p/3 setting, from
+            rossmann_bagging_only.Rmd. See README section 5.
+  RUNTIME   43 min measured. The from-scratch GBM is 34 min of that.
+
+  Self-contained: this file does not source() any other script. It loads the
+  data, builds its own features and split, and fits its own models.
+  See README.md for the full map from thesis tables to scripts.
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache   = FALSE,
+  fig.align = "center"
+)
+set.seed(42)
+```
+
+# Purpose
+
+This file computes the **Stage 1** model comparison on the full Rossmann data
+**without lag features**, training every model from scratch on the same
+train/test split. It replaces the earlier setup in which the linear, CART,
+bagging, random-forest, and from-scratch-GBM rows were carried over as stored
+constants: here all nine models are fitted and evaluated in one reproducible
+pass, so the whole table comes from a single run under the same pipeline.
+
+Models compared:
+
+- two naive baselines (store-mean, store-day-of-week),
+- linear regression,
+- a single CART tree,
+- bagged trees,
+- random forest,
+- gradient boosting implemented from scratch,
+- XGBoost,
+- LightGBM.
+
+# 1. Packages and configuration
+
+```{r packages}
+library(tidyverse)
+library(lubridate)
+library(rpart)
+library(ranger)
+library(xgboost)
+library(lightgbm)
+
+# ---- Paths: adjust if the CSVs live elsewhere -------------------------------
+DATA_DIR  <- "."                       # folder containing train.csv and store.csv
+TRAIN_CSV <- file.path(DATA_DIR, "train.csv")
+STORE_CSV <- file.path(DATA_DIR, "store.csv")
+
+# ---- Run configuration ------------------------------------------------------
+DETECTED_CORES <- parallel::detectCores()
+N_THREADS <- if (is.na(DETECTED_CORES)) 1L else max(1L, DETECTED_CORES - 1L)
+TEST_DAYS <- 42        # last 42 days form the test set (June–July 2015)
+VAL_FRAC  <- 0.15      # last 15% of the training dates used as a validation
+                       # slice for boosting early stopping
+SEED      <- 42
+set.seed(SEED)
+```
+
+# 2. Data loading and preprocessing
+
+```{r load-data}
+train_raw <- read_csv(TRAIN_CSV, show_col_types = FALSE)
+store_raw <- read_csv(STORE_CSV, show_col_types = FALSE)
+
+train_raw <- train_raw %>% mutate(Date = as.Date(Date))
+```
+
+Closed days and zero-sales days are removed, the store table is joined, and a
+compact set of calendar and store features is engineered.
+
+```{r preprocess}
+df <- train_raw %>%
+  filter(Open == 1, Sales > 0) %>%
+  left_join(store_raw, by = "Store") %>%
+  mutate(
+    Year       = year(Date),
+    Month      = month(Date),
+    Week       = isoweek(Date),
+    DayOfMonth = mday(Date),
+    Quarter    = quarter(Date),
+    IsWeekend  = as.integer(DayOfWeek %in% c(6, 7)),
+    StateHoliday = case_when(
+      StateHoliday == "a" ~ 1L,
+      StateHoliday == "b" ~ 2L,
+      StateHoliday == "c" ~ 3L,
+      TRUE                ~ 0L
+    ),
+    CompetitionOpenMonths = ifelse(
+      !is.na(CompetitionOpenSinceYear) & !is.na(CompetitionOpenSinceMonth),
+      (Year - CompetitionOpenSinceYear) * 12 + (Month - CompetitionOpenSinceMonth),
+      NA_real_
+    ),
+    CompetitionOpenMonths = pmax(CompetitionOpenMonths, 0, na.rm = TRUE),
+    StoreType  = as.integer(factor(StoreType,  levels = c("a", "b", "c", "d"))),
+    Assortment = as.integer(factor(Assortment, levels = c("a", "b", "c")))
+  ) %>%
+  select(Store, Date, Sales, DayOfWeek, Promo, StateHoliday, SchoolHoliday,
+         StoreType, Assortment, CompetitionDistance, Promo2,
+         Year, Month, Week, DayOfMonth, Quarter, IsWeekend,
+         CompetitionOpenMonths)
+
+# Impute the few missing competition fields
+med_comp_dist <- median(df$CompetitionDistance, na.rm = TRUE)
+df <- df %>%
+  mutate(
+    CompetitionDistance   = replace_na(CompetitionDistance, med_comp_dist),
+    CompetitionOpenMonths = replace_na(CompetitionOpenMonths, 0)
+  ) %>%
+  arrange(Date, Store)
+
+cat("Rows after cleaning:", nrow(df), "\n")
+cat("Stores:", n_distinct(df$Store), "\n")
+cat("Date range:", as.character(min(df$Date)), "to",
+    as.character(max(df$Date)), "\n")
+```
+
+```{r features}
+# Stage 1 feature set (no lag / rolling features)
+FEAT_S1 <- c("Store", "DayOfWeek", "Promo", "StateHoliday", "SchoolHoliday",
+             "StoreType", "Assortment", "CompetitionDistance", "Promo2",
+             "Year", "Month", "Week", "DayOfMonth", "Quarter", "IsWeekend",
+             "CompetitionOpenMonths")
+```
+
+# 3. Train / test split
+
+The split is temporal: the last `r TEST_DAYS` dates form the test set; all
+earlier observations are used for training.
+
+```{r split}
+split_data <- function(data, feature_cols, test_days = TEST_DAYS) {
+  data       <- data %>% arrange(Date, Store)
+  all_dates  <- sort(unique(data$Date))
+  cutoff     <- all_dates[length(all_dates) - test_days]
+
+  train <- data %>% filter(Date <= cutoff)
+  test  <- data %>% filter(Date >  cutoff)
+
+  list(
+    X_train = as.matrix(train[, feature_cols]),
+    y_train = train$Sales,
+    X_test  = as.matrix(test[, feature_cols]),
+    y_test  = test$Sales,
+    train   = train,
+    test    = test
+  )
+}
+
+split_s1 <- split_data(df, FEAT_S1)
+
+cat("Train rows:", length(split_s1$y_train),
+    "| Test rows:", length(split_s1$y_test), "\n")
+cat("Test period:", as.character(min(split_s1$test$Date)), "to",
+    as.character(max(split_s1$test$Date)), "\n")
+```
+
+# 4. Metrics
+
+```{r metrics}
+eval_metrics <- function(actual, pred) {
+  valid <- !is.na(actual) & actual != 0
+  tibble(
+    RMSE = sqrt(mean((actual - pred)^2)),
+    MAE  = mean(abs(actual - pred)),
+    MAPE = mean(abs((actual[valid] - pred[valid]) / actual[valid])) * 100
+  )
+}
+
+# Relative improvement (%) of a model over a reference RMSE
+delta_rel <- function(ref_rmse, model_rmse) (ref_rmse - model_rmse) / ref_rmse * 100
+```
+
+# 5. Models
+
+Each function takes the split and returns a one-row tibble of metrics.
+
+## 5.1 Naive baselines
+
+```{r m-naive}
+run_store_mean <- function(split) {
+  store_means <- split$train %>%
+    group_by(Store) %>%
+    summarise(m = mean(Sales), .groups = "drop")
+  pred <- split$test %>%
+    left_join(store_means, by = "Store") %>%
+    mutate(m = replace_na(m, mean(split$train$Sales))) %>%
+    pull(m)
+  eval_metrics(split$y_test, pred)
+}
+
+run_store_dow <- function(split) {
+  dow_means   <- split$train %>%
+    group_by(Store, DayOfWeek) %>%
+    summarise(m_dow = mean(Sales), .groups = "drop")
+  store_means <- split$train %>%
+    group_by(Store) %>%
+    summarise(m_store = mean(Sales), .groups = "drop")
+  global_mean <- mean(split$train$Sales)
+  pred <- split$test %>%
+    left_join(dow_means,   by = c("Store", "DayOfWeek")) %>%
+    left_join(store_means, by = "Store") %>%
+    mutate(pred = coalesce(m_dow, m_store, global_mean)) %>%
+    pull(pred)
+  eval_metrics(split$y_test, pred)
+}
+```
+
+## 5.2 Linear regression
+
+```{r m-linear}
+run_linear <- function(split) {
+  df_tr <- as.data.frame(split$X_train); df_tr$Sales <- split$y_train
+  df_te <- as.data.frame(split$X_test)
+  fit   <- lm(Sales ~ ., data = df_tr)
+  pred  <- predict(fit, newdata = df_te)
+  eval_metrics(split$y_test, pred)
+}
+```
+
+## 5.3 CART (single regression tree)
+
+```{r m-cart}
+run_cart <- function(split) {
+  df_tr <- as.data.frame(split$X_train); df_tr$Sales <- split$y_train
+  df_te <- as.data.frame(split$X_test)
+  fit   <- rpart(Sales ~ ., data = df_tr,
+                 control = rpart.control(maxdepth = 20, cp = 1e-5, minsplit = 10))
+  pred  <- predict(fit, newdata = df_te)
+  eval_metrics(split$y_test, pred)
+}
+```
+
+## 5.4 Bagging
+
+```{r m-bagging}
+run_bagging <- function(split, B = 200, min_node_size = 5) {
+  df_tr <- as.data.frame(split$X_train); df_tr$Sales <- split$y_train
+  df_te <- as.data.frame(split$X_test)
+  p <- ncol(split$X_train)
+
+  # Bagging is a random forest without feature subsampling: every split can use
+  # all predictors (mtry = p), while each tree is grown on a bootstrap sample.
+  fit <- ranger(
+    Sales ~ ., data = df_tr,
+    num.trees = B,
+    mtry = p,
+    min.node.size = min_node_size,
+    replace = TRUE,
+    sample.fraction = 1,
+    num.threads = N_THREADS,
+    seed = SEED,
+    verbose = FALSE
+  )
+  pred <- predict(fit, data = df_te)$predictions
+  eval_metrics(split$y_test, pred)
+}
+```
+
+## 5.5 Random forest
+
+```{r m-rf}
+run_rf <- function(split, B = 200) {
+  df_tr <- as.data.frame(split$X_train); df_tr$Sales <- split$y_train
+  fit   <- ranger(Sales ~ ., data = df_tr, num.trees = B,
+                  num.threads = N_THREADS, seed = SEED, verbose = FALSE)
+  pred  <- predict(fit, data = as.data.frame(split$X_test))$predictions
+  eval_metrics(split$y_test, pred)
+}
+```
+
+## 5.6 Gradient boosting from scratch
+
+`rpart` trees fitted sequentially to the residuals, scaled by a learning rate.
+This is the transparent reference implementation of boosting, not a tuned
+library, but it is given enough capacity to be a fair competitor rather than an
+under-powered straw man. Each round fits a depth-`depth` tree on a random
+`row_frac` subsample of the rows (**stochastic** gradient boosting). The
+subsampling roughly halves the per-tree cost *and* tends to improve
+generalisation, so we can afford more rounds without the runtime exploding.
+`B`, `lr`, `depth`, and `row_frac` trade runtime against accuracy; drop `B` to
+100 for a quicker pass.
+
+```{r m-gbm-scratch}
+run_gbm_scratch <- function(split, B = 200, lr = 0.08, depth = 6,
+                            row_frac = 0.5) {
+  X_tr <- as.data.frame(split$X_train)
+  X_te <- as.data.frame(split$X_test)
+  y    <- split$y_train
+  n    <- nrow(X_tr)
+
+  F_tr <- rep(mean(y), n)
+  F_te <- rep(mean(y), nrow(X_te))
+  for (b in seq_len(B)) {
+    idx  <- sample(n, floor(n * row_frac))          # stochastic row subsample
+    df_b <- X_tr[idx, ]; df_b$resid <- (y - F_tr)[idx]
+    fit  <- rpart(resid ~ ., data = df_b,
+                  control = rpart.control(maxdepth = depth, cp = 0, minsplit = 20))
+    F_tr <- F_tr + lr * predict(fit, newdata = X_tr)
+    F_te <- F_te + lr * predict(fit, newdata = X_te)
+  }
+  eval_metrics(split$y_test, F_te)
+}
+```
+
+## 5.7 XGBoost
+
+Number of boosting rounds is chosen on a temporal validation slice (the last
+`r scales::percent(VAL_FRAC)` of the training dates), then the model is refit on
+the full training set.
+
+```{r m-xgb}
+temporal_val_index <- function(train_df, val_frac = VAL_FRAC) {
+  dates  <- sort(unique(train_df$Date))
+  cutoff <- dates[floor(length(dates) * (1 - val_frac))]
+  which(train_df$Date > cutoff)            # rows used for validation
+}
+
+run_xgboost <- function(split, max_rounds = 1500, early_stop = 50) {
+  X_tr <- split$X_train; y_tr <- split$y_train
+  val_idx <- temporal_val_index(split$train)
+  tr_idx  <- setdiff(seq_along(y_tr), val_idx)
+
+  dtrain <- xgb.DMatrix(X_tr[tr_idx, ],  label = y_tr[tr_idx])
+  dval   <- xgb.DMatrix(X_tr[val_idx, ], label = y_tr[val_idx])
+  params <- list(objective = "reg:squarederror", eta = 0.10, max_depth = 6,
+                 subsample = 0.8, colsample_bytree = 0.8,
+                 nthread = N_THREADS, verbosity = 0)
+  fit_es <- xgb.train(params, dtrain, nrounds = max_rounds,
+                      watchlist = list(val = dval),
+                      early_stopping_rounds = early_stop, verbose = 0)
+  best_n <- fit_es$best_iteration
+
+  fit <- xgb.train(params, xgb.DMatrix(X_tr, label = y_tr),
+                   nrounds = best_n, verbose = 0)
+  pred <- predict(fit, xgb.DMatrix(split$X_test))
+  eval_metrics(split$y_test, pred)
+}
+```
+
+## 5.8 LightGBM
+
+```{r m-lgbm}
+run_lightgbm <- function(split, max_rounds = 2000, early_stop = 50) {
+  X_tr <- split$X_train; y_tr <- split$y_train
+  val_idx <- temporal_val_index(split$train)
+  tr_idx  <- setdiff(seq_along(y_tr), val_idx)
+
+  dtrain <- lgb.Dataset(X_tr[tr_idx, ],  label = y_tr[tr_idx])
+  dval   <- lgb.Dataset(X_tr[val_idx, ], label = y_tr[val_idx])
+  params <- list(objective = "regression", metric = "rmse",
+                 num_leaves = 63, learning_rate = 0.05,
+                 bagging_fraction = 0.8, bagging_freq = 1,
+                 feature_fraction = 0.8, num_threads = N_THREADS,
+                 seed = SEED, verbosity = -1)
+  fit_es <- lgb.train(params, dtrain, nrounds = max_rounds,
+                      valids = list(val = dval),
+                      early_stopping_rounds = early_stop, verbose = -1)
+  best_n <- fit_es$best_iter
+
+  fit <- lgb.train(params, lgb.Dataset(X_tr, label = y_tr),
+                   nrounds = best_n, verbose = -1)
+  pred <- predict(fit, split$X_test)
+  eval_metrics(split$y_test, pred)
+}
+```
+
+# 6. Run all models
+
+```{r run-all}
+models <- list(
+  "Store-mean naive" = run_store_mean,
+  "Store-DOW naive"  = run_store_dow,
+  "Linear"           = run_linear,
+  "CART"             = run_cart,
+  "Bagging"          = run_bagging,
+  "Random Forest"    = run_rf,
+  "GBM (scratch)"    = run_gbm_scratch,
+  "XGBoost"          = run_xgboost,
+  "LightGBM"         = run_lightgbm
+)
+
+results <- map_dfr(names(models), function(nm) {
+  set.seed(SEED)
+  t0  <- proc.time()
+  met <- models[[nm]](split_s1)
+  cat(sprintf("%-18s done in %5.1f s\n", nm, (proc.time() - t0)["elapsed"]))
+  met %>% mutate(Model = nm, .before = 1)
+})
+```
+
+# 7. Results
+
+RMSE is the primary ranking metric. `Delta_rel` is the improvement over the
+store-mean baseline; `Delta_DOW` is the improvement over the stronger
+store-day-of-week baseline.
+
+```{r results-table}
+rmse_mean <- results$RMSE[results$Model == "Store-mean naive"]
+rmse_dow  <- results$RMSE[results$Model == "Store-DOW naive"]
+
+results_tbl <- results %>%
+  mutate(
+    Delta_rel = delta_rel(rmse_mean, RMSE),
+    Delta_DOW = delta_rel(rmse_dow,  RMSE)
+  ) %>%
+  arrange(RMSE) %>%
+  mutate(across(c(RMSE, MAE), ~round(.x, 0)),
+         across(c(MAPE, Delta_rel, Delta_DOW), ~round(.x, 1)))
+
+results_tbl
+# Written for the thesis: Table 11 (Stage 1). This file supplies the pooled
+# models. The random-forest row reported in the thesis uses mtry = p/3 and
+# comes from rossmann_bagging_only.Rmd; the three statistical benchmarks are
+# fitted per store in rossmann_old_m_to_modern_ml_experiment.Rmd.
+dir.create("thesis_tables", showWarnings = FALSE)
+readr::write_csv(results_tbl, "thesis_tables/stage1_pooled_models.csv")
+```
+
+```{r results-plot, fig.width=8, fig.height=5}
+results_tbl %>%
+  mutate(Model = fct_reorder(Model, RMSE)) %>%
+  ggplot(aes(x = RMSE, y = Model)) +
+  geom_col(fill = "#4C72B0", width = 0.65) +
+  geom_text(aes(label = RMSE), hjust = -0.15, size = 3.4) +
+  labs(title = "Stage 1 — RMSE by model (full Rossmann, no lag features)",
+       x = "Test RMSE", y = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  theme_minimal(base_size = 12)
+```
+
+# 8. Session information
+
+```{r session-info}
+sessionInfo()
+```
