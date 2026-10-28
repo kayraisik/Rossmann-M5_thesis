@@ -48,7 +48,9 @@ training history, the store mix and the information the models see.
 | `rossmann_bagging_only.Rmd` | Bagging and random forest settings | `bagging_rf_configs` |
 | `rossmann_old_m_to_modern_ml_experiment.Rmd` | Auto-ARIMA, ETS and Theta | `statistical_benchmarks` |
 | `rossmann_decomposition.Rmd` | Store level, predictable part and residual | `decomposition`, `decomposition_store1` |
-| `rossmann_stages2_4.Rmd` | Stages 2–4: stores, training window, store type, lags, rolling windows | `stage2_nstores`, `stage2_window`, `stage2_storetype`, `stage3_lags`, `stage4_rolling` |
+| `rossmann_stages2_4.Rmd` | Stages 2–4: training window, store type, lags, rolling windows | `stage2_window`, `stage2_storetype`, `stage3_lags`, `stage4_rolling` |
+| `rossmann_stage2_nstores_20draws.Rmd` | Stage 2: number of stores, 20 random draws per size | `stage2_nstores`, `stage2_nstores_draws` |
+| `rossmann_stage2_nstores_tests.R` | Paired tests of the number-of-stores effect | `stage2_nstores_tests` |
 | `rossmann_window6_diagnostic.Rmd` | Why XGBoost fails with six months of training data | `stage2_window_diag` |
 | `rossmann_rolling_december.Rmd` | December test window | `rolling_december` |
 | `rossmann_stage5.Rmd` | Stage 5: nested information sets | `stage5_information_sets` |
