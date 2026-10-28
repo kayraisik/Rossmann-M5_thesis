@@ -1,0 +1,3 @@
+"Model","slope_per_log_N","slope_se","slope_t","p_two_sided","p_one_sided_increase","diff_500_minus_50","paired_t","paired_p","draws"
+"XGBoost",-2.086,0.4001,-5.213,6.38e-06,1,-4.771,-4.967,8.556e-05,20
+"LightGBM",-1.086,0.3833,-2.834,0.00725,0.9964,-2.465,-2.631,0.01644,20
