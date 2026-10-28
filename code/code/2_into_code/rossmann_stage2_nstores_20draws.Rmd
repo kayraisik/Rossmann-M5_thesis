@@ -1,0 +1,81 @@
+---
+title: "Rossmann — number-of-stores experiment with 20 draws"
+author: "Kayra Işık"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    theme: flatly
+    code_folding: show
+---
+
+<!-- ---------------------------------------------------------------------------
+  FILE      rossmann_stage2_nstores_20draws.Rmd
+  PURPOSE   Stage 2.1 (number of stores) of rossmann_stages2_4.Rmd, run with 20
+            random store draws per size instead of 5, plus formal tests of
+            Prediction 1 (the gain increases with the number of stores).
+            Draws 1-5 use the same seeds as rossmann_stages2_4.Rmd.
+  INPUTS    train.csv, store.csv, rossmann_stages2_4.Rmd (pipeline chunk only)
+  OUTPUTS   stage2_nstores.csv        (means and standard errors; Table 13)
+            stage2_nstores_draws.csv  (one row per draw)
+            stage2_nstores_tests.csv  (tests of Prediction 1, via rossmann_stage2_nstores_tests.R)
+--------------------------------------------------------------------------- -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Pipeline
+
+```{r pipeline}
+# The pipeline chunk of rossmann_stages2_4.Rmd, so data, features, split and
+# model settings are exactly those of Stage 2.
+lines <- readLines("rossmann_stages2_4.Rmd")
+start <- grep("^```\\{r pipeline", lines)[1]
+end   <- start + which(grepl("^```\\s*$", lines[(start + 1):length(lines)]))[1]
+eval(parse(text = lines[(start + 1):(end - 1)]), envir = globalenv())
+N_REPS <- 20
+```
+
+# Draws
+
+```{r draws}
+all_stores <- unique(df$Store)
+draws <- map_dfr(c(50, 200, 500, length(all_stores)), function(N) {
+  reps <- if (N == length(all_stores)) 1 else N_REPS
+  map_dfr(seq_len(reps), function(r) { set.seed(SEED + r)
+    sub <- if (N == length(all_stores)) df else df %>% filter(Store %in% sample(all_stores, N))
+    run_panel(sub, as.character(N)) %>% mutate(draw = r) }) })
+draws <- draws %>% mutate(N = as.integer(Condition))
+write_csv(draws, "stage2_nstores_draws.csv")
+```
+
+# Table 13
+
+```{r summary}
+draw_se <- function(x) if (length(x) > 1) sd(x) / sqrt(length(x)) else NA_real_
+s_mean <- draws %>% group_by(N) %>%
+  summarise(across(c(Naive_RMSE, StoreDOW_RMSE, XGB_RMSE, LGBM_RMSE,
+                     StoreDOW_delta, XGB_delta, LGBM_delta), mean), .groups = "drop")
+s_se <- draws %>% group_by(N) %>%
+  summarise(XGB_delta_se = draw_se(XGB_delta), LGBM_delta_se = draw_se(LGBM_delta),
+            reps = n(), .groups = "drop")
+stage2_n <- left_join(s_mean, s_se, by = "N") %>% arrange(N) %>%
+  mutate(across(where(is.double), ~round(.x, 2)))
+stage2_n
+write_csv(stage2_n, "stage2_nstores.csv")
+```
+
+# Tests of Prediction 1
+
+Within a draw the store samples are nested (same seed for every size), so the
+tests pair by draw. They are in `rossmann_stage2_nstores_tests.R`, which reads
+`stage2_nstores_draws.csv` and writes `stage2_nstores_tests.csv`.
+
+```{r tests}
+source("rossmann_stage2_nstores_tests.R")
+```
+
+```{r session}
+sessionInfo()
+```
